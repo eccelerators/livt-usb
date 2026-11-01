@@ -1,12 +1,12 @@
 [project]
 name = "Livt.Usb"
-version = "0.0.1"
+version = "0.0.2"
 path = "src"
 outdir = "out"
 
 [dependencies]
-"Livt.Utils" = { path = "../livt-utils" }
-"Livt.IO" = { path = "../livt-io" }
+"Livt.Utils" = "1.1.0"
+"Livt.IO" = "1.6.0"
 
 [tests]
 path = "tests"

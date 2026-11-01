@@ -2,6 +2,14 @@
 
 All notable changes to this package are documented here.
 
+## 0.0.2
+
+### Changed
+
+- Replaced sibling path dependencies with published registry versions:
+  `Livt.IO 1.6.0` and `Livt.Utils 1.1.0`.
+- Updated package usage documentation for installation without sibling library checkouts.
+
 ## 0.0.1
 
 ### Added
@@ -33,7 +41,7 @@ All notable changes to this package are documented here.
 - `Livt.IO 1.6.0` supplies memory contracts and storage implementations.
 - `Livt.Utils 1.1.0` supplies protocol-independent CRC helpers; USB CRC profiles
   and wire serialization remain in `Livt.Usb.Packets`.
-- The workspace manifest resolves both dependencies through sibling checkout paths.
+- The initial manifest resolved both dependencies through sibling checkout paths.
   UART transport, CLI commands and platform integration remain application choices.
 
 ### Scope

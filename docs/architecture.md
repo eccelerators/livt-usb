@@ -1,6 +1,6 @@
 # Package architecture
 
-`Livt.Usb 0.0.1` owns portable USB signaling, packets, host services and supported
+`Livt.Usb 0.0.2` owns portable USB signaling, packets, host services and supported
 class handlers. Applications own terminal commands, keyboard layouts and data-use
 policy. Platform integration owns clock generation, reset conditioning, VBUS,
 electrical pads and timing constraints.

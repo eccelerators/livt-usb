@@ -6,7 +6,7 @@ HID boot-keyboard support in a separate base library alongside `Livt.IO`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
-Version 0.0.1 provides:
+Version 0.0.2 provides:
 
 - `Livt.Usb.IO.Usb2Phy`: low-speed and full-speed signaling with context-derived timing.
 - `Livt.Usb.Packets`: token, data and handshake processing with PID and CRC checks.
@@ -22,13 +22,14 @@ Version 0.0.1 provides:
 
 ```toml
 [dependencies]
-"Livt.Usb" = "0.0.1"
+"Livt.Usb" = "0.0.2"
 ```
 
 The library uses `Livt.IO 1.6.0` for memory interfaces and implementations and
-`Livt.Utils 1.1.0` for generic CRC helpers. The workspace manifest resolves these
-through sibling checkout paths. Applications using their types directly should
-also declare those dependencies.
+`Livt.Utils 1.1.0` for generic CRC helpers. Both dependencies are pinned to
+published package versions and resolved from the registry; no sibling library
+checkouts are required. Applications using their types directly should also
+declare those dependencies.
 
 `Livt.Usb` has no UART or CLI dependency. Applications supply their own transport,
 commands and presentation; platform integration supplies clocks, reset and I/O pads.
@@ -165,7 +166,7 @@ storage alternatives and root-port timing across clock contexts.
 
 ## 🚧 Scope and Outlook
 
-Version 0.0.1 supports one directly attached low/full-speed device, one active or
+Version 0.0.2 supports one directly attached low/full-speed device, one active or
 retained host request, and boot-keyboard HID. Standard discovery defaults to a
 512-byte configuration bound, four interfaces and three nonzero endpoints plus EP0.
 Only alternate setting zero and the first configuration are selected.
