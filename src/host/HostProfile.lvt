@@ -1,0 +1,80 @@
+namespace Livt.Usb.Host
+
+using Livt.Usb
+
+/**
+ * Stateless validation for the initial direct-attachment low/full-speed profile.
+ * Provides bounded geometry and request checks without allocating endpoint tables.
+ */
+component HostProfile<PROFILE_TRANSFER_BYTES: int = 512>
+{
+	static assert PROFILE_TRANSFER_BYTES >= 8 && PROFILE_TRANSFER_BYTES <= 65535, "Transfer capacity must be 8..65535 bytes"
+
+	// Initial bounded topology; actual table allocation belongs to enumeration.
+	public const DEVICE_CAPACITY: int = 1
+	public const INTERFACE_CAPACITY: int = 4
+	public const ENDPOINT_CAPACITY: int = 4
+
+	/**
+	 * Allows control/interrupt at low/full speed and bulk only at full speed.
+	 */
+	public fn Supports[](speed: UsbSpeed, kind: TransferKind) bool
+	{
+		if (speed != UsbSpeed.Low && speed != UsbSpeed.Full) {
+			return false
+		}
+
+		if (kind == TransferKind.Isochronous) {
+			return false
+		}
+
+		return kind != TransferKind.Bulk || speed == UsbSpeed.Full
+	}
+
+	/**
+	 * Checks address/endpoint ranges, transfer bounds and endpoint packet geometry.
+	 * Does not establish that an endpoint was enumerated; the controller owns binding.
+	 */
+	public fn IsValid[](speed: UsbSpeed, address: int, endpoint: int, kind: TransferKind,
+		maxPacketSize: int, length: int, timeoutFrames: int, intervalFrames: int) bool
+	{
+		if (!Supports(speed, kind) || address < 0 || address > 127 || endpoint < 0 || endpoint > 15) {
+			return false
+		}
+
+		if (length < 0 || length > PROFILE_TRANSFER_BYTES || timeoutFrames < 1 || timeoutFrames > 65535) {
+			return false
+		}
+
+		if (kind == TransferKind.Control) {
+			if (endpoint != 0) {
+				return false
+			}
+		} else {
+			if (endpoint == 0 || address == 0) {
+				return false
+			}
+		}
+
+		if (kind == TransferKind.Interrupt) {
+			var packetLimit: int = 64
+
+			if (speed == UsbSpeed.Low) {
+				packetLimit = 8
+			}
+
+			return intervalFrames >= 1 && intervalFrames <= 255
+				&& maxPacketSize >= 1 && maxPacketSize <= packetLimit
+		}
+
+		if (intervalFrames != 0) {
+			return false
+		}
+
+		if (speed == UsbSpeed.Low) {
+			return maxPacketSize == 8
+		}
+
+		return maxPacketSize == 8 || maxPacketSize == 16 || maxPacketSize == 32 || maxPacketSize == 64
+	}
+}

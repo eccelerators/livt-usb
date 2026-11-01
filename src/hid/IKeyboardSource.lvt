@@ -1,0 +1,35 @@
+namespace Livt.Usb.Hid
+
+/**
+ * Scheduled observation of keyboard usage events without borrowing controller ownership.
+ * One consumer serializes event reads; counters/status are snapshots.
+ */
+interface IKeyboardSource
+{
+	/**
+	 * Returns lifecycle status: disconnected, enumerating, unsupported, initializing,
+	 * polling or failed, encoded as 0 through 5.
+	 */
+	fn GetStatus() byte
+
+	/**
+	 * Returns standard enumeration phase 0 through 6.
+	 */
+	fn GetPhase() byte
+
+	/**
+	 * Returns cumulative events lost to bounded queue overflow.
+	 */
+	fn GetDropped() uint
+
+	/**
+	 * Returns cumulative rejected or rollover reports.
+	 */
+	fn GetBadReports() uint
+
+	/**
+	 * Removes one event, or returns false and zero. Bits 7..0 usage, 15..8 modifiers,
+	 * 16 pressed and 17 disconnect. Consumer retains accepted data under backpressure.
+	 */
+	fn TryReadEvent(value: out logic[18]) bool
+}

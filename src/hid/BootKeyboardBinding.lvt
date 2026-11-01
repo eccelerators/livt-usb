@@ -1,0 +1,28 @@
+namespace Livt.Usb.Hid
+
+/**
+ * Excludes known auxiliary interfaces that advertise the boot-keyboard class.
+ * Standard class, direction and endpoint checks remain in BootKeyboardHost.
+ * Keep device exceptions here so generic enumeration and transfer logic stay shared.
+ */
+component BootKeyboardBinding
+{
+	// Known Rapoo receivers: interface 1 carries auxiliary controls; 2 carries keys.
+	const RAPOO_9300M: logic[32] = 0x24AE2013
+	const RAPOO_RECEIVER_2010: logic[32] = 0x24AE2010
+	const RAPOO_AUXILIARY_INTERFACE: int = 1
+
+	/**
+	 * Accepts a validated interface unless a documented device exception excludes it.
+	 * Identity packs VID in the upper half and PID in the lower half. The caller
+	 * supplies the descriptor's interface number, not its table index or endpoint.
+	 * 2013 evidence: https://github.com/tmk/tmk_keyboard/issues/764
+	 * 2010 identity was read on the board; Linux receiver logs identify interface 2:
+	 * https://forums.raspberrypi.com/viewtopic.php?t=240314
+	 */
+	public static fn AcceptsInterface[](identity: logic[32], interfaceNumber: int) bool
+	{
+		return (identity != RAPOO_9300M && identity != RAPOO_RECEIVER_2010)
+			|| interfaceNumber != RAPOO_AUXILIARY_INTERFACE
+	}
+}

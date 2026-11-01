@@ -1,0 +1,83 @@
+namespace Livt.Usb.IO
+
+using Livt.Usb
+
+/**
+ * Low/full-speed USB PHY implemented in an inherited clock/reset context.
+ * Owns line sampling, encoding and pad direction; the link owns packet bytes,
+ * speed selection and bus-reset duration. Supports no high-speed negotiation.
+ * Board buffers connect separate input/output/enables and release on clock failure.
+ */
+component Usb2Phy : IUsb2Phy
+{
+	// Rate validity also gates physical drive in builds that strip assertions.
+	const CLOCK_HZ: uint = this.context.TicksPer(1Hz)
+	const FULL_BIT_TICKS: uint = this.context.TicksPer(12MHz)
+
+	// Owned timing-critical paths and their combinational control bindings.
+	line: Usb2LineReceiver
+	receiver: Usb2PacketReceiver
+	transmitter: Usb2PacketTransmitter
+	receiveEnabled: bool
+	lineEnabled: bool
+	allowStart: bool
+	cancel: bool
+
+	// Board-facing single-ended pad controls; both output enables share ownership.
+	public dpOutput: out logic
+	public dmOutput: out logic
+	public dpEnable: out logic
+	public dmEnable: out logic
+
+	/**
+	 * Binds raw input pins. The context must provide an integral number of samples
+	 * per 12 MHz bit, at least eight. Change speed only while TX/RX are idle and
+	 * bus reset is inactive.
+	 */
+	new(dpInput: logic, dmInput: logic)
+	{
+		line = new Usb2LineReceiver(dpInput, dmInput, this.speed, lineEnabled)
+		receiver = new Usb2PacketReceiver(this.speed, receiveEnabled, line.lineState,
+			line.bitTick, line.bitState, line.idle, line.se0, line.longSe0, line.invalid)
+		transmitter = new Usb2PacketTransmitter(this.speed, allowStart, cancel,
+			this.txValid, this.txData, this.keepAliveRequest)
+	}
+
+	/**
+	 * Connects cycle-level streams, prioritizes bus reset and guards pad ownership.
+	 */
+	process Ports[]()
+	{
+		var clockValid = CLOCK_HZ % 12000000 == 0 && FULL_BIT_TICKS >= 8
+		var supported = clockValid && (speed == UsbSpeed.Low || speed == UsbSpeed.Full)
+		var resetting = this.context.rst == 0b1
+		cancel = resetting || busReset || !supported
+		lineEnabled = !cancel
+		receiveEnabled = !cancel && !transmitter.busy
+		allowStart = !cancel && !receiver.active && line.idle && line.modeReady
+		supportsLowSpeed = clockValid
+		supportsFullSpeed = clockValid
+		lineState = line.lineState
+		txReady = transmitter.ready
+		txBusy = transmitter.busy
+		keepAliveReady = transmitter.keepAliveReady
+		rxActive = receiver.active && receiveEnabled
+		rxValid = receiver.valid && receiveEnabled
+		rxData = receiver.data
+		rxError = receiver.error && !cancel
+		dpOutput = transmitter.output[1]
+		dmOutput = transmitter.output[0]
+		dpEnable = 0b0
+		dmEnable = 0b0
+
+		if (clockValid && !resetting && (busReset || transmitter.enable)) {
+			dpEnable = 0b1
+			dmEnable = 0b1
+		}
+
+		if (busReset) {
+			dpOutput = 0b0
+			dmOutput = 0b0
+		}
+	}
+}

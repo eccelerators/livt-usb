@@ -1,0 +1,51 @@
+namespace Livt.Usb.Tests
+
+using Livt.IO
+using Livt.Usb
+using Livt.Usb.Testing
+
+/**
+ * Verifies actual interface return values across different backend specializations.
+ */
+@Test
+component ControllerDispatchTest
+{
+	// Default BRAM-intent and explicit array configurations share the consumer contract.
+	block: TestHostController
+	array: TestHostController<32, MemoryStyle.Block, ArrayRam<byte, 32>>
+	probe: ControllerDispatchProbe
+	arrayView: IHostController
+
+	/**
+	 * Binds the same consumer to an interface rather than a concrete model type.
+	 */
+	new()
+	{
+		block = new TestHostController()
+		array = new TestHostController<32, MemoryStyle.Block, ArrayRam<byte, 32>>()
+		probe = new ControllerDispatchProbe(block)
+		arrayView = array
+	}
+
+	/**
+	 * Alternating nonzero capacities detects stale/default captures through both routes.
+	 */
+	@Test
+	fn CapturesCompletedInterfaceCallsAcrossBackends()
+	{
+		block.Reset()
+		array.Reset()
+		assert probe.ReadBoundCapacity() == 512
+		assert probe.ReadParameterCapacity(array) == 32
+		assert probe.ReadParameterCapacity(block) == 512
+		assert probe.ReadParameterCapacity(array) == 32
+		assert array.Connect(UsbSpeed.Full)
+		assert arrayView.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.DeviceToHost, 64, 33, 5, 0) == SubmissionResult.Invalid
+		assert arrayView.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.DeviceToHost, 64, 1, 5, 0) == SubmissionResult.Accepted
+		assert array.ReceiveByte(0xAB)
+		assert array.Complete(TransferResult.Success, 1)
+		var value: byte
+		assert arrayView.TryReadInput(0, value)
+		assert value == 0xAB
+	}
+}

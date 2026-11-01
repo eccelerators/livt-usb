@@ -1,0 +1,56 @@
+namespace Livt.Usb.Packets
+
+using Livt.Usb
+
+/**
+ * USB-specific checksum conventions and final packet-shape validation.
+ * CRC calculation itself belongs to Livt.Utils.Hashing.Crc.
+ */
+component PacketIntegrity
+{
+	// USB uses reflected CRCs with all-ones initialization and final XOR.
+	public const TOKEN_INITIAL: logic[5] = 0x1F
+	public const TOKEN_FINAL_XOR: logic[5] = 0x1F
+	public const DATA_INITIAL: logic[16] = 0xFFFF
+	public const DATA_FINAL_XOR: logic[16] = 0xFFFF
+	public const DATA_RESIDUE: logic[16] = 0xB001
+	public const TOKEN_BITS: int = 11
+	public const TOKEN_BYTES: uint = 3
+	public const DATA_OVERHEAD: uint = 3
+	public const LOW_SPEED_PAYLOAD_LIMIT: uint = 8
+
+	/**
+	 * Validates an admitted PID's final byte count and checksum. Count includes
+	 * PID/CRC; expectedToken is computed over exactly the eleven token field bits.
+	 */
+	public static fn Validate[](pid: byte, count: uint, speed: UsbSpeed,
+		checksum: logic[16], tokenWord: logic[16], expectedToken: logic[5]) PacketError
+	{
+		if (count == 0) {
+			return PacketError.Length
+		}
+
+		if (PacketPid.IsData(pid)) {
+			if (count < DATA_OVERHEAD
+				|| (speed == UsbSpeed.Low && count > LOW_SPEED_PAYLOAD_LIMIT + DATA_OVERHEAD)) {
+				return PacketError.Length
+			}
+
+			if (checksum != DATA_RESIDUE) {
+				return PacketError.Checksum
+			}
+		} elif (PacketPid.IsToken(pid)) {
+			if (count != TOKEN_BYTES) {
+				return PacketError.Length
+			}
+
+			if ((tokenWord >> TOKEN_BITS) != (expectedToken as logic[16])) {
+				return PacketError.Checksum
+			}
+		} elif (count != 1) {
+			return PacketError.Length
+		}
+
+		return PacketError.None
+	}
+}

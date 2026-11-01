@@ -1,0 +1,367 @@
+namespace Livt.Usb.Testing
+
+using Livt.IO
+using Livt.Usb
+using Livt.Usb.Host
+
+/**
+ * Deterministic, manually advanced IHostController test double; no physical USB I/O.
+ * One test owner serializes calls, injects received bytes and advances frame deadlines.
+ * Accepted request snapshots and completion retention match the public contract.
+ * No autonomous process, enumeration, token handling or endpoint toggle simulation.
+ */
+component TestHostController<MODEL_TRANSFER_BYTES: int = 512, STYLE: MemoryStyle = MemoryStyle.Block,
+	B: IRam<byte> & new() = Ram<byte, MODEL_TRANSFER_BYTES, STYLE>> : IHostController
+{
+	static assert MODEL_TRANSFER_BYTES >= 8 && MODEL_TRANSFER_BYTES <= 65535, "Transfer capacity must be 8..65535 bytes"
+
+	// Owned policy/storage and connection state, separate from retained completion.
+	profile: HostProfile<MODEL_TRANSFER_BYTES>
+	storage: TransferStorage<MODEL_TRANSFER_BYTES, STYLE, B>
+	connected: bool
+	speed: UsbSpeed
+	transferState: TransferState
+	result: TransferResult
+	actualLength: int
+	framesRemaining: int
+
+	// Observable accepted request snapshot for tests; consumers use IHostController.
+	public submittedAddress: int
+	public submittedEndpoint: int
+	public submittedKind: TransferKind
+	public submittedDirection: TransferDirection
+	public submittedMaxPacketSize: int
+	public submittedLength: int
+	public submittedIntervalFrames: int
+
+	/**
+	 * Creates a disconnected, idle controller with owned configurable storage.
+	 */
+	new()
+	{
+		profile = new HostProfile<MODEL_TRANSFER_BYTES>()
+		storage = new TransferStorage<MODEL_TRANSFER_BYTES, STYLE, B>()
+	}
+
+	/**
+	 * Reports the initial profile's speed/type support independently of connection.
+	 */
+	override fn Supports(speed: UsbSpeed, kind: TransferKind) bool
+	{
+		return profile.Supports(speed, kind)
+	}
+
+	/**
+	 * Returns one direct device; this model does not enumerate or allocate a table.
+	 */
+	override fn GetDeviceCapacity() int
+	{
+		return 1
+	}
+
+	/**
+	 * Returns the initial profile's four interface entries.
+	 */
+	override fn GetInterfaceCapacity() int
+	{
+		return 4
+	}
+
+	/**
+	 * Returns four endpoint entries, counting control endpoint zero once.
+	 */
+	override fn GetEndpointCapacity() int
+	{
+		return 4
+	}
+
+	/**
+	 * Returns data-stage capacity excluding setup bytes.
+	 */
+	override fn GetTransferCapacity() int
+	{
+		return MODEL_TRANSFER_BYTES
+	}
+
+	/**
+	 * Reports the manually established test connection.
+	 */
+	override fn IsConnected() bool
+	{
+		return connected
+	}
+
+	/**
+	 * Returns speed or Unknown after disconnection/reset.
+	 */
+	override fn GetSpeed() UsbSpeed
+	{
+		return speed
+	}
+
+	/**
+	 * Stages setup only while Idle; active/completed transfers retain their snapshot.
+	 */
+	override fn TryStageSetup(value: byte) bool
+	{
+		if (transferState != TransferState.Idle) {
+			return false
+		}
+
+		return storage.TryAppendSetup(value)
+	}
+
+	/**
+	 * Stages output only while Idle, with no mutation on failure.
+	 */
+	override fn TryStageOutput(value: byte) bool
+	{
+		if (transferState != TransferState.Idle) {
+			return false
+		}
+
+		return storage.TryAppendPayload(value)
+	}
+
+	/**
+	 * Discards rejected/prepared requests only when no transfer owns storage.
+	 */
+	override fn TryClearStaging() bool
+	{
+		if (transferState != TransferState.Idle) {
+			return false
+		}
+
+		storage.Clear()
+		return true
+	}
+
+	/**
+	 * Validates and reserves one request. No completion occurs until a test hook acts.
+	 * Rejections preserve staging and the previous accepted request snapshot.
+	 */
+	override fn TrySubmit(address: int, endpoint: int, kind: TransferKind,
+		direction: TransferDirection, maxPacketSize: int, length: int,
+		timeoutFrames: int, intervalFrames: int) SubmissionResult
+	{
+		if (transferState != TransferState.Idle) {
+			return SubmissionResult.Busy
+		}
+
+		if (!connected) {
+			return SubmissionResult.Disconnected
+		}
+
+		if (!profile.Supports(speed, kind)) {
+			return SubmissionResult.Unsupported
+		}
+
+		if (!profile.IsValid(speed, address, endpoint, kind, maxPacketSize, length, timeoutFrames, intervalFrames)
+			|| !storage.IsValid(kind, direction, length)) {
+			return SubmissionResult.Invalid
+		}
+
+		submittedAddress = address
+		submittedEndpoint = endpoint
+		submittedKind = kind
+		submittedDirection = direction
+		submittedMaxPacketSize = maxPacketSize
+		submittedLength = length
+		submittedIntervalFrames = intervalFrames
+		framesRemaining = timeoutFrames
+		actualLength = 0
+		result = TransferResult.Pending
+		transferState = TransferState.Active
+		return SubmissionResult.Accepted
+	}
+
+	/**
+	 * Reports retained lifecycle state without advancing the simulated bus.
+	 */
+	override fn GetState() TransferState
+	{
+		return transferState
+	}
+
+	/**
+	 * Reports the terminal result, or Pending while idle/active.
+	 */
+	override fn GetResult() TransferResult
+	{
+		return result
+	}
+
+	/**
+	 * Returns the retained completion length, zero before completion.
+	 */
+	override fn GetActualLength() int
+	{
+		return actualLength
+	}
+
+	/**
+	 * Reads only retained input completion bytes; failure writes zero.
+	 */
+	override fn TryReadInput(index: int, value: out byte) bool
+	{
+		value = 0
+
+		if (transferState != TransferState.Complete || submittedDirection != TransferDirection.DeviceToHost
+			|| index < 0 || index >= actualLength) {
+			return false
+		}
+
+		return storage.TryReadPayload(index, value)
+	}
+
+	/**
+	 * Completes active work as Cancelled, preserving already injected input bytes.
+	 */
+	override fn Cancel() bool
+	{
+		if (transferState != TransferState.Active) {
+			return false
+		}
+
+		Finish(TransferResult.Cancelled, ReceivedLength())
+		return true
+	}
+
+	/**
+	 * Releases completion and clears payload/setup metadata for the next request.
+	 */
+	override fn TryRelease() bool
+	{
+		if (transferState != TransferState.Complete) {
+			return false
+		}
+
+		storage.Clear()
+		transferState = TransferState.Idle
+		result = TransferResult.Pending
+		actualLength = 0
+		return true
+	}
+
+	/**
+	 * Establishes a supported test connection only from disconnected, idle state.
+	 */
+	public fn Connect(speed: UsbSpeed) bool
+	{
+		if (connected || transferState != TransferState.Idle || !profile.Supports(speed, TransferKind.Control)) {
+			return false
+		}
+
+		this.speed = speed
+		connected = true
+		return true
+	}
+
+	/**
+	 * Disconnects and completes active work; a previously completed result is retained.
+	 */
+	public fn Disconnect()
+	{
+		connected = false
+		speed = UsbSpeed.Unknown
+
+		if (transferState == TransferState.Active) {
+			Finish(TransferResult.Disconnected, ReceivedLength())
+		}
+	}
+
+	/**
+	 * Injects one validated IN byte while active. Overflow terminates the request.
+	 * Packet CRC, ACK/toggle behavior and packet boundaries are not modeled.
+	 */
+	public fn ReceiveByte(value: byte) bool
+	{
+		if (transferState != TransferState.Active || submittedDirection != TransferDirection.DeviceToHost) {
+			return false
+		}
+
+		if (storage.GetLength() >= submittedLength || !storage.TryAppendPayload(value)) {
+			Finish(TransferResult.Overflow, storage.GetLength())
+			return false
+		}
+
+		return true
+	}
+
+	/**
+	 * Injects terminal outcome. IN length must equal injected bytes; successful OUT
+	 * must acknowledge the full request. Pending/Disconnected/Cancelled use other hooks.
+	 */
+	public fn Complete(result: TransferResult, actualLength: int) bool
+	{
+		if (transferState != TransferState.Active || result == TransferResult.Pending
+			|| result == TransferResult.Disconnected || result == TransferResult.Cancelled
+			|| actualLength < 0 || actualLength > submittedLength) {
+			return false
+		}
+
+		if (submittedDirection == TransferDirection.DeviceToHost) {
+			if (actualLength != storage.GetLength()) {
+				return false
+			}
+		} else {
+			if (result == TransferResult.Success && actualLength != submittedLength) {
+				return false
+			}
+		}
+
+		Finish(result, actualLength)
+		return true
+	}
+
+	/**
+	 * Advances one modeled millisecond; expires active work exactly at its deadline.
+	 */
+	public fn AdvanceFrame()
+	{
+		if (transferState == TransferState.Active) {
+			framesRemaining--
+
+			if (framesRemaining == 0) {
+				Finish(TransferResult.Timeout, ReceivedLength())
+			}
+		}
+	}
+
+	/**
+	 * Resets the test lifecycle and disconnects; no old completion survives.
+	 */
+	public fn Reset()
+	{
+		storage.Clear()
+		connected = false
+		speed = UsbSpeed.Unknown
+		transferState = TransferState.Idle
+		result = TransferResult.Pending
+		actualLength = 0
+		framesRemaining = 0
+	}
+
+	/**
+	 * Returns the injected input prefix, or zero for output not yet acknowledged.
+	 */
+	fn ReceivedLength() int
+	{
+		if (submittedDirection == TransferDirection.DeviceToHost) {
+			return storage.GetLength()
+		}
+
+		return 0
+	}
+
+	/**
+	 * Publishes data before exposing terminal state; the serialized caller owns mutation.
+	 */
+	fn Finish(result: TransferResult, actualLength: int)
+	{
+		storage.Publish()
+		this.result = result
+		this.actualLength = actualLength
+		transferState = TransferState.Complete
+	}
+}

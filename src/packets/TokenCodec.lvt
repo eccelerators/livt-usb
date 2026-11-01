@@ -1,0 +1,40 @@
+namespace Livt.Usb.Packets
+
+/**
+ * Pure USB token field layout. CRC calculation remains a separate dependency.
+ * SOF supplies its eleven-bit frame number directly instead of address/endpoint.
+ */
+component TokenCodec
+{
+	/**
+	 * Packs seven address bits followed by four endpoint bits, transmitted LSB first.
+	 */
+	public static fn Fields[](address: logic[7], endpoint: logic[4]) logic[11]
+	{
+		return ((address as uint) | ((endpoint as uint) << 7)) as logic[11]
+	}
+
+	/**
+	 * Appends five checksum bits; transmit the low byte before the high byte.
+	 */
+	public static fn Pack[](fields: logic[11], crc: logic[5]) logic[16]
+	{
+		return ((fields as uint) | ((crc as uint) << 11)) as logic[16]
+	}
+
+	/**
+	 * Extracts the address of an IN/OUT/SETUP token.
+	 */
+	public static fn Address[](fields: logic[11]) logic[7]
+	{
+		return (fields & 0x7F) as logic[7]
+	}
+
+	/**
+	 * Extracts the endpoint of an IN/OUT/SETUP token.
+	 */
+	public static fn Endpoint[](fields: logic[11]) logic[4]
+	{
+		return (fields >> 7) as logic[4]
+	}
+}

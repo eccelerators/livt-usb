@@ -1,0 +1,42 @@
+namespace Livt.Usb.IO
+
+using Livt.Usb
+
+/**
+ * Low/full-speed PHY byte boundary, with directions relative to the PHY provider.
+ * Signals are sampled on the shared rising edge; no scheduled methods or RX stalls.
+ * TX accepts a byte only on txValid && txReady. Hold data/valid across backpressure;
+ * drop txValid after the final accepted byte to request EOP, then wait for !txBusy.
+ * RX bytes include PID/CRC but exclude SYNC/EOP; rxError invalidates the whole packet.
+ * This is a project contract inspired by UTMI, not a complete UTMI implementation.
+ * See docs/phy.md for reset, keep-alive and completion timing.
+ */
+interface IUsb2Phy
+{
+	// Link-owned configuration; change speed only with both paths idle.
+	speed: in UsbSpeed
+	busReset: in bool
+
+	// Link-owned packet stream, accepted only on the joint valid/ready edge.
+	txValid: in bool
+	txData: in byte
+	txReady: out bool
+	txBusy: out bool
+
+	// Low-speed keep-alive request/acceptance, separate from packet bytes.
+	keepAliveRequest: in bool
+	keepAliveReady: out bool
+
+	// PHY-owned receive events; consumers must capture every active/valid byte.
+	rxActive: out bool
+	rxValid: out bool
+	rxData: out byte
+	rxError: out bool
+
+	// Physical D+/D- snapshot: bit 1 is D+, bit 0 is D-; no speed-dependent encoding.
+	lineState: out logic[2]
+
+	// Static provider capabilities; these do not imply attachment or enumeration.
+	supportsLowSpeed: out bool
+	supportsFullSpeed: out bool
+}

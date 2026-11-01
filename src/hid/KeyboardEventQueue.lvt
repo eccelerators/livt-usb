@@ -1,0 +1,102 @@
+namespace Livt.Usb.Hid
+
+using Livt.IO
+
+/**
+ * Bounded scheduled single-producer/single-consumer event queue. One arbiter owns
+ * storage and indices; independent callers may enqueue and dequeue concurrently.
+ * Defaults to block RAM; substitute a compatible IRam for register/distributed storage.
+ */
+component KeyboardEventQueue<CAPACITY: int = 32, STYLE: MemoryStyle = MemoryStyle.Block,
+	B: IRam<logic[18]> & new() = SequentialRam<logic[18], CAPACITY, STYLE>>
+{
+	static assert CAPACITY > 0, "Event queue capacity must be positive"
+
+	// Counts include CAPACITY, so full and empty remain distinct.
+	const COUNT_BITS: int = Bits.RequiredFor(CAPACITY)
+
+	// Owned storage and independent request/result mailboxes.
+	ram: B
+	pushRequest: bool
+	pushSeen: bool
+	pushValue: logic[18]
+	pushAccepted: bool
+	popRequest: bool
+	popSeen: bool
+	popValue: logic[18]
+	popAccepted: bool
+	head: logic[COUNT_BITS]
+	tail: logic[COUNT_BITS]
+	count: logic[COUNT_BITS]
+
+	/**
+	 * Creates an empty queue; RAM is read only after an accepted write.
+	 */
+	new()
+	{
+		ram = new B()
+	}
+
+	/**
+	 * Returns false without mutation if the queue is full at arbitration time.
+	 */
+	public fn TryEnqueue(value: logic[18]) bool
+	{
+		pushValue = value;
+		pushRequest = !pushRequest
+
+		while (pushSeen != pushRequest) {}
+
+		return pushAccepted
+	}
+
+	/**
+	 * Returns the oldest event, or false and zero when empty at arbitration time.
+	 */
+	public fn TryDequeue(value: out logic[18]) bool
+	{
+		popRequest = !popRequest
+
+		while (popSeen != popRequest) {}
+
+		value = popValue
+		return popAccepted
+	}
+
+	/**
+	 * Services each pending operation once per turn; neither caller can starve.
+	 */
+	process Service()
+	{
+		if (popRequest != popSeen) {
+			popAccepted = count != 0;
+			popValue = 0
+
+			if (popAccepted) {
+				popValue = ram.Read((head as uint) as int)
+				head++
+
+				if (head == (CAPACITY as logic[COUNT_BITS])) { head = 0 }
+
+				count--
+			}
+
+			popSeen = popRequest
+		}
+
+		if (pushRequest != pushSeen) {
+			pushAccepted = count != (CAPACITY as logic[COUNT_BITS])
+
+			if (pushAccepted) {
+				ram.Write((tail as uint) as int, pushValue)
+				tail++
+
+				if (tail == (CAPACITY as logic[COUNT_BITS])) { tail = 0 }
+
+				count++
+			}
+
+			pushSeen = pushRequest
+		}
+	}
+}

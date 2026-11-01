@@ -1,0 +1,130 @@
+namespace Livt.Usb.Hid
+
+using Livt.IO
+
+/**
+ * Layout-independent boot keyboard transitions. Accept eight-byte reports, then drain
+ * Next before accepting another. Rollover/error usages 1..3 reject the entire report
+ * and retain held state. Duplicate usages and repeated reports emit no extra presses.
+ * Event bits: 7..0 HID usage, 15..8 current modifiers, 16 pressed (zero is released).
+ */
+component BootKeyboardReportParser<B: IRam<byte> & new() = SequentialRam<byte, 16, MemoryStyle.Block>>
+{
+	// Two fixed eight-byte reports in one exclusively accessed storage port.
+	// Previous starts at zero, current at eight. Modifiers are cached for bit access.
+	reports: B
+	previousModifiers: byte
+	currentModifiers: byte
+	cursor: byte
+	initialized: bool
+
+	/**
+	 * Owns sixteen report bytes; validity metadata guards unwritten and retained cells.
+	 * Calls are serialized; Next drains before Accept.
+	 * A compatible IRam backend can select register arrays or another storage style.
+	 */
+	new()
+	{
+		reports = new B()
+	}
+
+	/**
+	 * Discards held state without clearing RAM; use Accept(zero report) to emit releases.
+	 */
+	public fn Reset()
+	{
+		initialized = false
+		previousModifiers = 0
+		currentModifiers = 0
+
+		cursor = 28
+	}
+
+	/**
+	 * Snapshots a valid report and begins release-before-press transition delivery.
+	 */
+	public fn Accept(report: byte[8]) bool
+	{
+		for (var index: byte = 2; index < 8; index++) {
+			if (report[index as int] >= 1 && report[index as int] <= 3) { return false }
+		}
+
+		for (var index: byte = 0; index < 8; index++) {
+			var previous: byte
+			previous = 0
+
+			if (initialized) { previous = reports.Read((index as int) + 8) }
+
+			reports.Write(index as int, previous)
+			reports.Write((index as int) + 8, report[index as int])
+		}
+
+		initialized = true
+		previousModifiers = currentModifiers
+		currentModifiers = report[0]
+
+		cursor = 0
+		return true
+	}
+
+	/**
+	 * Searches fixed usage slots through the shared memory port.
+	 * The before bound suppresses duplicate usages within the same report.
+	 */
+	fn Contains(base: byte, usage: byte, before: byte) bool
+	{
+		for (var index: byte = 2; index < before; index++) {
+			if (reports.Read((base as int) + (index as int)) == usage) { return true }
+		}
+
+		return false
+	}
+
+	/**
+	 * Returns the next changed key/modifier, or false and zero after all 28 candidates.
+	 */
+	public fn Next(value: out logic[18]) bool
+	{
+		value = 0
+
+		if (!initialized) { return false }
+
+		while (cursor < 28) {
+			var position = cursor
+
+			if (position >= 14) { position = ((position as int) - 14) as byte }
+
+			var pressed = cursor >= 14
+			var usage: byte
+			var changed = false
+			cursor++
+
+			if (position < 8) {
+				usage = (224 + (position as int)) as byte
+				var mask = (1 as byte) << (position as int)
+				changed = ((previousModifiers ^ currentModifiers) & mask) != 0 && (((currentModifiers & mask) != 0) == pressed)
+			} else {
+				var base: byte
+				base = 0
+
+				if (pressed) { base = 8 }
+
+				usage = reports.Read((base as int) + (position as int) - 6)
+
+				var before = ((position as int) - 6) as byte
+
+				if (pressed) { changed = usage != 0 && !Contains(0, usage, 8) && !Contains(8, usage, before) } else { changed = usage != 0 && !Contains(8, usage, 8) && !Contains(0, usage, before) }
+			}
+
+			if (changed) {
+				value = (usage as logic[18]) | ((currentModifiers as logic[18]) << 8)
+
+				if (pressed) { value = value | 65536 }
+
+				return true
+			}
+		}
+
+		return false
+	}
+}

@@ -1,0 +1,312 @@
+namespace Livt.Usb.Descriptors
+
+using Livt.Usb
+using Livt.IO
+
+/**
+ * Streaming bounded configuration parser, independent of HID or other class policy.
+ * Keeps alternate zero for up to four interfaces and three nonzero endpoints.
+ * Unknown descriptor types are skipped by length. Invalid lengths, duplicate endpoint
+ * addresses, truncated descriptors and unsupported geometry fail closed.
+ */
+component ConfigurationDescriptorParser<LIMIT: int = 512,
+	B: IRam<byte> & new() = SequentialRam<byte, 32, MemoryStyle.Block>>
+{
+	static assert LIMIT >= 9 && LIMIT <= 65535, "Configuration bound must be 9..65535"
+
+	// The stream count includes LIMIT; untrusted total length retains all 16 bits.
+	const COUNT_BITS: int = Bits.RequiredFor(LIMIT)
+
+	// Current descriptor header and bounded stream counters.
+	header: byte[9]
+	offset: byte
+	length: byte
+	descriptorType: byte
+	consumed: logic[COUNT_BITS]
+	total: logic[16]
+	invalid: bool
+	configuration: byte
+	declaredInterfaces: byte
+	interfaces: byte
+	endpoints: byte
+	currentInterface: byte
+	alternateZero: bool
+	expectedEndpoints: byte
+	seenEndpoints: byte
+
+	// Small duplicate-detection arrays and one exclusively accessed endpoint table.
+	// Eight bytes per endpoint: attributes, MPS low/high, interval, number/class/sub/protocol.
+	numbers: byte[4]
+	addresses: byte[3]
+	currentClass: byte
+	currentSubclass: byte
+	currentProtocol: byte
+	table: B
+
+	/**
+	 * Owns 32 metadata bytes; only the completed endpoint prefix can be read.
+	 * Calls must be serialized. Substitute a compatible IRam to select other storage.
+	 */
+	new()
+	{
+		table = new B()
+	}
+
+	/**
+	 * Starts a new configuration; only initialized table prefixes can be queried.
+	 */
+	public fn Reset()
+	{
+		offset = 0;
+		length = 0;
+		consumed = 0;
+		total = 0;
+		invalid = false
+		interfaces = 0;
+		endpoints = 0;
+		configuration = 0;
+		declaredInterfaces = 0
+		currentInterface = 255;
+		alternateZero = false;
+		expectedEndpoints = 0;
+		seenEndpoints = 0
+	}
+
+	/**
+	 * Consumes one byte without allocating storage proportional to descriptor length.
+	 */
+	public fn Feed(value: byte)
+	{
+		if (invalid) { return }
+
+		if ((consumed as uint) >= (LIMIT as uint) || (total != 0 && (consumed as uint) >= (total as uint))) {
+			invalid = true;
+			return
+		}
+
+		if (offset == 0) {
+			length = value
+
+			if (length < 2 || (consumed as uint) + (length as uint) > (LIMIT as uint) || (total != 0 && (consumed as uint) + (length as uint) > (total as uint))) {
+				invalid = true;
+				return
+			}
+		}
+
+		if (offset < 9) { header[offset as int] = value }
+
+		if (offset == 1) { descriptorType = value }
+
+		offset++;
+		consumed++
+
+		if (offset == length) {
+			FinishDescriptor();
+			offset = 0
+		}
+	}
+
+	/**
+	 * Validates and commits one complete standard descriptor; skips unknown types.
+	 */
+	fn FinishDescriptor()
+	{
+		if (total == 0) {
+			if (descriptorType != 2 || length != 9) {
+				invalid = true;
+				return
+			}
+
+			total = (header[2] as logic[16]) | ((header[3] as logic[16]) << 8)
+			declaredInterfaces = header[4]
+			configuration = header[5]
+
+			if (total < 9 || (total as uint) > (LIMIT as uint) || configuration == 0 || declaredInterfaces < 1 || declaredInterfaces > 4) { invalid = true }
+
+			return
+		}
+
+		if (descriptorType == 2 || descriptorType == 1) {
+			invalid = true;
+			return
+		}
+
+		if (descriptorType == 4) {
+			if (length != 9 || (alternateZero && seenEndpoints != expectedEndpoints)) {
+				invalid = true;
+				return
+			}
+
+			alternateZero = header[3] == 0
+
+			if (!alternateZero) { return }
+
+			if (interfaces == 4 || header[5] == 9) {
+				invalid = true;
+				return
+			}
+
+			for (var index: byte = 0; index < interfaces; index++) {
+				if (numbers[index as int] == header[2]) {
+					invalid = true;
+					return
+				}
+			}
+
+			currentInterface = interfaces
+			numbers[interfaces as int] = header[2]
+			currentClass = header[5]
+			currentSubclass = header[6]
+			currentProtocol = header[7]
+			expectedEndpoints = header[4]
+			seenEndpoints = 0
+			interfaces++
+		} elif (descriptorType == 5) {
+			if (currentInterface == 255 || length < 7) {
+				invalid = true;
+				return
+			}
+
+			if (!alternateZero) { return }
+
+			if (endpoints == 3 || (header[2] & 15) == 0 || (header[2] & 112) != 0) {
+				invalid = true;
+				return
+			}
+
+			for (var index: byte = 0; index < endpoints; index++) {
+				if (addresses[index as int] == header[2]) {
+					invalid = true;
+					return
+				}
+			}
+
+			addresses[endpoints as int] = header[2]
+
+			for (var field: byte = 0; field < 8; field++) {
+				var value: byte
+
+				match field
+				{
+					0 =>
+					{
+						value = header[3] & 3
+					}
+					1 =>
+					{
+						value = header[4]
+					}
+					2 =>
+					{
+						value = header[5]
+					}
+					3 =>
+					{
+						value = header[6]
+					}
+					4 =>
+					{
+						value = numbers[currentInterface as int]
+					}
+					5 =>
+					{
+						value = currentClass
+					}
+					6 =>
+					{
+						value = currentSubclass
+					}
+					_ =>
+					{
+						value = currentProtocol
+					}
+				}
+
+				table.Write((endpoints as int) * 8 + (field as int), value)
+			}
+
+			endpoints++;
+			seenEndpoints++
+		}
+	}
+
+	/**
+	 * Exposes the header length after nine valid bytes for a bounded second request.
+	 */
+	public fn GetTotalLength() int
+	{
+		if (invalid || consumed < 9) { return 0 }
+
+		return (total as uint) as int
+	}
+
+	/**
+	 * Requires exact stream length and matching interface/endpoint declarations.
+	 */
+	public fn IsValid(speed: UsbSpeed) bool
+	{
+		if (invalid || (consumed as uint) != (total as uint) || total == 0 || offset != 0 || interfaces != declaredInterfaces
+			|| (alternateZero && seenEndpoints != expectedEndpoints)) { return false }
+
+		for (var index: byte = 0; index < endpoints; index++) {
+			var row = (index as int) * 8
+			var low = table.Read(row + 1)
+			var high = table.Read(row + 2)
+			var size = (low as logic[16]) | ((high as logic[16]) << 8)
+			var attributes = table.Read(row)
+			var interval = table.Read(row + 3)
+
+			if (size < 1 || size > 64 || (speed == UsbSpeed.Low && size > 8)) { return false }
+
+			if (attributes == 0 || attributes == 1) { return false }
+
+			if (attributes == 2 && (speed != UsbSpeed.Full || (size != 8 && size != 16 && size != 32 && size != 64))) { return false }
+
+			if (attributes == 3 && interval == 0) { return false }
+		}
+
+		return true
+	}
+
+	/**
+	 * Returns the configuration value after complete validation.
+	 */
+	public fn GetConfiguration() int
+	{
+		return configuration as int
+	}
+
+	/**
+	 * Returns the initialized endpoint count after complete validation.
+	 */
+	public fn GetEndpointCount() int
+	{
+		return endpoints as int
+	}
+
+	/**
+	 * Finds an endpoint's interface class tuple without imposing class selection.
+	 * Fields: 0 address, 1 transfer type, 2 packet bytes, 3 interval frames,
+	 * 4 interface number, 5 class, 6 subclass, 7 protocol. Invalid queries return -1.
+	 */
+	public fn GetEndpoint(index: int, field: int) int
+	{
+		if (index < 0 || index >= (endpoints as int)) { return -1 }
+
+		if (field == 0) { return addresses[index] as int }
+
+		if (field < 1 || field > 7) { return -1 }
+
+		var row = index * 8
+
+		if (field == 2) {
+			var low = table.Read(row + 1)
+			var high = table.Read(row + 2)
+			return (low as int) | ((high as int) << 8)
+		}
+
+		if (field == 1) { return table.Read(row) as int }
+
+		return table.Read(row + field) as int
+	}
+}

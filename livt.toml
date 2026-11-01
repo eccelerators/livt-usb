@@ -1,0 +1,19 @@
+[project]
+name = "Livt.Usb"
+version = "0.0.1"
+path = "src"
+outdir = "out"
+
+[dependencies]
+"Livt.Utils" = { path = "../livt-utils" }
+"Livt.IO" = { path = "../livt-io" }
+
+[tests]
+path = "tests"
+components = ["PacketBufferTest", "PacketBufferConfigurationTest", "HostControllerTest", "ControllerDispatchTest", "Usb2PhyTest", "PacketCodecTest", "PacketReceiverTest", "DescriptorKeyboardTest", "RootPortTiming48Test", "RootPortTiming96Test", "RootPortTiming144Test"]
+
+[build.debug]
+warnings = ["all"]
+
+[build.release]
+warnings = ["all"]

@@ -1,0 +1,75 @@
+namespace Livt.Usb.Tests
+
+using Livt.Usb
+using Livt.Usb.Host
+
+/**
+ * Counts physical edges independently of the root port's duration calculations.
+ * Expected counts are independent literal values for the 144 MHz test context.
+ */
+@Test
+@Context(ClockFrequency = 144MHz)
+component RootPortTiming144Test
+{
+	port: RootPort<10, 20, 30>
+	resetTicks: uint
+	frameTicks: uint
+	frameSeen: bool
+	frameError: bool
+
+	/**
+	 * Owns the root port under test in the inherited context.
+	 */
+	new()
+	{
+		port = new RootPort<10, 20, 30>()
+	}
+
+	/**
+	 * Counts reset width and complete frame intervals without scheduled calls.
+	 */
+	process Measure()
+	{
+		state {
+			if (port.busReset) { resetTicks++ }
+
+			if (!port.connected) {
+				frameTicks = 0
+				frameSeen = false
+			} elif (port.frameTick) {
+				if (frameSeen && frameTicks != 143999) {
+					frameError = true
+				}
+
+				frameSeen = true
+				frameTicks = 0
+			} else { frameTicks++ }
+		}
+	}
+
+	/**
+	 * Checks configured debounce/reset/recovery, frame spacing and SE0 disconnect.
+	 */
+	@Test
+	fn PreservesDurations()
+	{
+		port.line = 2
+		port.driving = false
+		port.resetRequest = false
+		Simulation.Wait(1296)
+		assert !port.busReset && !port.connected
+		Simulation.Wait(288)
+		assert port.busReset && port.speed == UsbSpeed.Full
+		Simulation.Wait(2880)
+		assert !port.busReset && !port.connected
+		assert resetTicks == 2880
+		Simulation.Wait(436464)
+		assert port.connected
+		assert frameSeen && !frameError
+		port.line = 0
+		Simulation.Wait(144)
+		assert port.connected
+		Simulation.Wait(432)
+		assert !port.connected && port.speed == UsbSpeed.Unknown
+	}
+}

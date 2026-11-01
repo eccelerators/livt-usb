@@ -1,0 +1,216 @@
+namespace Livt.Usb.Tests
+
+using Livt.Usb
+using Livt.Usb.Testing
+
+/**
+ * Exercises retained host-transfer ownership through an interface-typed dependency.
+ * The concrete model supplies bus events; it is never used as a hardware controller.
+ */
+@Test
+component HostControllerTest
+{
+	// One model and a borrowed consumer view of the same instance.
+	model: TestHostController
+	host: ControllerClient
+	reader: ControllerDispatchProbe
+
+	/**
+	 * Binds the public interface once in the constructor, matching consumer composition.
+	 */
+	new()
+	{
+		model = new TestHostController()
+		host = new ControllerClient(model)
+		reader = new ControllerDispatchProbe(model)
+	}
+
+	/**
+	 * Serializes the interface output-parameter dispatch through one scheduled caller.
+	 */
+	fn ReadInput(index: int, value: out byte) bool
+	{
+		return reader.TryReadInput(index, value)
+	}
+
+	/**
+	 * Acceptance freezes identity, completion may be short, and release gates reuse.
+	 */
+	@Test
+	fn RetainsShortInputAndRejectsOverlappingRequests()
+	{
+		model.Reset()
+		assert model.Connect(UsbSpeed.Full)
+		assert host.GetTransferCapacity() == 512
+		assert host.GetDeviceCapacity() == 1
+		assert host.GetInterfaceCapacity() == 4
+		assert host.GetEndpointCapacity() == 4
+		assert host.TrySubmit(7, 3, TransferKind.Interrupt, TransferDirection.DeviceToHost, 8, 8, 20, 10) == SubmissionResult.Accepted
+		assert host.GetState() == TransferState.Active
+		assert host.GetResult() == TransferResult.Pending
+		assert !host.TryRelease()
+		assert !host.TryClearStaging()
+		assert !host.TryStageSetup(0)
+		assert !host.TryStageOutput(0)
+		assert host.TrySubmit(8, 4, TransferKind.Bulk, TransferDirection.DeviceToHost, 64, 64, 20, 0) == SubmissionResult.Busy
+		assert model.submittedAddress == 7
+		assert model.submittedEndpoint == 3
+		assert model.submittedIntervalFrames == 10
+		assert model.ReceiveByte(0xA5)
+		assert model.ReceiveByte(0x5A)
+		var value: byte = 0xFF
+		assert !ReadInput(0, value)
+		assert value == 0
+		assert !model.Complete(TransferResult.Success, 3)
+		assert model.Complete(TransferResult.Success, 2)
+		assert host.GetState() == TransferState.Complete
+		assert host.GetActualLength() == 2
+		assert host.GetResult() == TransferResult.Success
+		assert ReadInput(0, value)
+		assert value == 0xA5
+		assert ReadInput(1, value)
+		assert value == 0x5A
+		assert !ReadInput(2, value)
+		assert value == 0
+		assert !host.Cancel()
+		assert host.TrySubmit(7, 3, TransferKind.Interrupt, TransferDirection.DeviceToHost, 8, 8, 20, 10) == SubmissionResult.Busy
+		assert host.TryRelease()
+		assert !ReadInput(0, value)
+		assert host.GetState() == TransferState.Idle
+		assert host.GetResult() == TransferResult.Pending
+	}
+
+	/**
+	 * Both zero-length requests and short input ending with no bytes retain success.
+	 */
+	@Test
+	fn CompletesZeroLengthAndZeroByteShortInput()
+	{
+		model.Reset()
+		assert model.Connect(UsbSpeed.Full)
+		assert host.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.HostToDevice, 64, 0, 2, 0) == SubmissionResult.Accepted
+		assert model.Complete(TransferResult.Success, 0)
+		assert host.GetActualLength() == 0
+		assert host.GetResult() == TransferResult.Success
+		assert host.TryRelease()
+		assert host.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.DeviceToHost, 64, 64, 2, 0) == SubmissionResult.Accepted
+		assert model.Complete(TransferResult.Success, 0)
+		assert host.GetState() == TransferState.Complete
+		assert host.GetActualLength() == 0
+		assert host.GetResult() == TransferResult.Success
+	}
+
+	/**
+	 * Rejected geometry preserves staged bytes; partial successful OUT is prohibited.
+	 */
+	@Test
+	fn PreservesOutputOnRejectedSubmission()
+	{
+		model.Reset()
+		assert model.Connect(UsbSpeed.Full)
+		assert host.TryStageOutput(0x41)
+		assert host.TrySubmit(128, 1, TransferKind.Bulk, TransferDirection.HostToDevice, 64, 1, 2, 0) == SubmissionResult.Invalid
+		assert host.TrySubmit(1, 16, TransferKind.Bulk, TransferDirection.HostToDevice, 64, 1, 2, 0) == SubmissionResult.Invalid
+		assert host.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.HostToDevice, 7, 1, 2, 0) == SubmissionResult.Invalid
+		assert host.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.HostToDevice, 64, 2, 2, 0) == SubmissionResult.Invalid
+		assert host.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.HostToDevice, 64, 1, 2, 0) == SubmissionResult.Accepted
+		assert !model.Complete(TransferResult.Success, 0)
+		assert model.Complete(TransferResult.Success, 1)
+		var value: byte = 0xFF
+		assert !ReadInput(0, value)
+		assert value == 0
+	}
+
+	/**
+	 * Setup length, direction and wLength are checked before a control request is owned.
+	 */
+	@Test
+	fn ValidatesSetupAndControlDataStages()
+	{
+		model.Reset()
+		assert model.Connect(UsbSpeed.Low)
+		assert host.TrySubmit(0, 0, TransferKind.Control, TransferDirection.DeviceToHost, 8, 8, 20, 0) == SubmissionResult.Invalid
+		assert host.TryStageSetup(0x80)
+		assert host.TryStageSetup(0x06)
+		assert host.TryStageSetup(0)
+		assert host.TryStageSetup(1)
+		assert host.TryStageSetup(0)
+		assert host.TryStageSetup(0)
+		assert host.TryStageSetup(8)
+		assert host.TryStageSetup(0)
+		assert !host.TryStageSetup(0)
+		assert host.TrySubmit(0, 0, TransferKind.Control, TransferDirection.DeviceToHost, 8, 7, 20, 0) == SubmissionResult.Invalid
+		assert host.TrySubmit(0, 0, TransferKind.Control, TransferDirection.HostToDevice, 8, 8, 20, 0) == SubmissionResult.Invalid
+		assert host.TrySubmit(0, 0, TransferKind.Control, TransferDirection.DeviceToHost, 8, 8, 20, 0) == SubmissionResult.Accepted
+		assert model.Complete(TransferResult.Success, 0)
+		assert host.TryRelease()
+
+		for (var i = 0; i < 8; i++) {
+			assert host.TryStageSetup(0)
+		}
+
+		assert host.TrySubmit(0, 0, TransferKind.Control, TransferDirection.HostToDevice, 8, 0, 20, 0) == SubmissionResult.Accepted
+		assert model.Complete(TransferResult.Success, 0)
+	}
+
+	/**
+	 * Deadline, cancellation, disconnect and reset have distinct retained-result behavior.
+	 */
+	@Test
+	fn TerminatesAndReleasesInterruptedTransfers()
+	{
+		model.Reset()
+		assert model.Connect(UsbSpeed.Full)
+		assert host.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.DeviceToHost, 64, 8, 2, 0) == SubmissionResult.Accepted
+		model.AdvanceFrame()
+		assert host.GetState() == TransferState.Active
+		model.AdvanceFrame()
+		assert host.GetResult() == TransferResult.Timeout
+		assert host.TryRelease()
+		assert host.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.DeviceToHost, 64, 8, 2, 0) == SubmissionResult.Accepted
+		assert model.ReceiveByte(0x42)
+		assert host.Cancel()
+		assert host.GetResult() == TransferResult.Cancelled
+		assert host.GetActualLength() == 1
+		model.Disconnect()
+		assert host.GetResult() == TransferResult.Cancelled
+		assert host.TryRelease()
+		assert host.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.DeviceToHost, 64, 8, 2, 0) == SubmissionResult.Disconnected
+		assert model.Connect(UsbSpeed.Full)
+		assert host.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.DeviceToHost, 64, 8, 2, 0) == SubmissionResult.Accepted
+		model.Disconnect()
+		assert host.GetResult() == TransferResult.Disconnected
+		assert host.GetSpeed() == UsbSpeed.Unknown
+		model.Reset()
+		assert host.GetState() == TransferState.Idle
+		assert host.GetResult() == TransferResult.Pending
+		assert !host.IsConnected()
+	}
+
+	/**
+	 * Capability rejection differs from invalid geometry; overflow retains a valid prefix.
+	 */
+	@Test
+	fn ReportsUnsupportedStallAndOverflow()
+	{
+		model.Reset()
+		assert model.Connect(UsbSpeed.Low)
+		assert host.Supports(UsbSpeed.Low, TransferKind.Interrupt)
+		assert !host.Supports(UsbSpeed.Low, TransferKind.Bulk)
+		assert !host.Supports(UsbSpeed.High, TransferKind.Control)
+		assert host.TrySubmit(1, 1, TransferKind.Bulk, TransferDirection.DeviceToHost, 8, 8, 2, 0) == SubmissionResult.Unsupported
+		assert host.TrySubmit(1, 1, TransferKind.Interrupt, TransferDirection.DeviceToHost, 8, 1, 2, 0) == SubmissionResult.Invalid
+		assert host.TrySubmit(1, 1, TransferKind.Interrupt, TransferDirection.DeviceToHost, 8, 1, 2, 10) == SubmissionResult.Accepted
+		assert model.Complete(TransferResult.Stall, 0)
+		assert host.GetResult() == TransferResult.Stall
+		assert host.TryRelease()
+		assert host.TrySubmit(1, 1, TransferKind.Interrupt, TransferDirection.DeviceToHost, 8, 1, 2, 10) == SubmissionResult.Accepted
+		assert model.ReceiveByte(0xA5)
+		assert !model.ReceiveByte(0xFF)
+		assert host.GetResult() == TransferResult.Overflow
+		assert host.GetActualLength() == 1
+		var value: byte
+		assert ReadInput(0, value)
+		assert value == 0xA5
+	}
+}

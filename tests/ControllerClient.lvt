@@ -1,0 +1,170 @@
+namespace Livt.Usb.Tests
+
+using Livt.Usb
+
+/**
+ * Scheduled test consumer using constructor injection for every controller operation.
+ * The installed compiler does not reliably lower direct local interface aliases.
+ * This adapter exercises the same dependency-binding path as application services.
+ */
+component ControllerClient
+{
+	// Borrowed controller; tests serialize all calls through this consumer.
+	controller: IHostController
+
+	/**
+	 * Binds an implementation that must outlive this consumer.
+	 */
+	new(controller: IHostController)
+	{
+		this.controller = controller
+	}
+
+	/**
+	 * Reports supported speed/type combinations, independent of attachment state.
+	 */
+	public fn Supports(speed: UsbSpeed, kind: TransferKind) bool
+	{
+		return controller.Supports(speed, kind)
+	}
+
+	/**
+	 * Returns the bounded simultaneous attached-device capacity, excluding the root port.
+	 */
+	public fn GetDeviceCapacity() int
+	{
+		return controller.GetDeviceCapacity()
+	}
+
+	/**
+	 * Returns the number of interface entries supported for the attached device.
+	 */
+	public fn GetInterfaceCapacity() int
+	{
+		return controller.GetInterfaceCapacity()
+	}
+
+	/**
+	 * Returns endpoint table capacity; control endpoint zero counts as one entry.
+	 */
+	public fn GetEndpointCapacity() int
+	{
+		return controller.GetEndpointCapacity()
+	}
+
+	/**
+	 * Returns maximum data-stage bytes per request, excluding eight setup bytes.
+	 */
+	public fn GetTransferCapacity() int
+	{
+		return controller.GetTransferCapacity()
+	}
+
+	/**
+	 * Reports attachment; this is a snapshot, not an enumeration or submission guarantee.
+	 */
+	public fn IsConnected() bool
+	{
+		return controller.IsConnected()
+	}
+
+	/**
+	 * Returns established speed or Unknown while disconnected.
+	 */
+	public fn GetSpeed() UsbSpeed
+	{
+		return controller.GetSpeed()
+	}
+
+	/**
+	 * Appends one of exactly eight control setup bytes while Idle; false changes nothing.
+	 */
+	public fn TryStageSetup(value: byte) bool
+	{
+		return controller.TryStageSetup(value)
+	}
+
+	/**
+	 * Appends an output data byte while Idle; false changes nothing when full/unavailable.
+	 */
+	public fn TryStageOutput(value: byte) bool
+	{
+		return controller.TryStageOutput(value)
+	}
+
+	/**
+	 * Clears staged setup/output only while Idle; returns false otherwise.
+	 */
+	public fn TryClearStaging() bool
+	{
+		return controller.TryClearStaging()
+	}
+
+	/**
+	 * Snapshots address 0..127 and endpoint 0..15 plus direction as endpoint identity.
+	 * length is data bytes; timeoutFrames is a 1..65535 millisecond deadline including
+	 * scheduling and retries. intervalFrames is 1..255 for interrupt, zero otherwise.
+	 * Control uses endpoint zero, eight setup bytes and setup wLength equal to length.
+	 * Output must be fully staged; input must have no staged output. Non-Accepted
+	 * leaves slot and buffers unchanged. Completion storage must be released first.
+	 */
+	public fn TrySubmit(address: int, endpoint: int, kind: TransferKind,
+		direction: TransferDirection, maxPacketSize: int, length: int,
+		timeoutFrames: int, intervalFrames: int) SubmissionResult
+	{
+		return controller.TrySubmit(address, endpoint, kind, direction, maxPacketSize, length, timeoutFrames, intervalFrames)
+	}
+
+	/**
+	 * Reports Idle, Active or retained Complete state without consuming it.
+	 */
+	public fn GetState() TransferState
+	{
+		return controller.GetState()
+	}
+
+	/**
+	 * Returns the retained terminal result, otherwise Pending.
+	 */
+	public fn GetResult() TransferResult
+	{
+		return controller.GetResult()
+	}
+
+	/**
+	 * Returns completed data bytes excluding setup/status, or zero before completion.
+	 * Successful input may be shorter than requested, including zero. Error results
+	 * may retain an acknowledged prefix; they are not successful application data.
+	 */
+	public fn GetActualLength() int
+	{
+		return controller.GetActualLength()
+	}
+
+	/**
+	 * Reads completed input bytes within actual length. Returns false with value zero
+	 * for output transfers, incomplete requests or invalid indices. Finish before release.
+	 */
+	public fn TryReadInput(index: int, value: out byte) bool
+	{
+		return controller.TryReadInput(index, value)
+	}
+
+	/**
+	 * Cancels Active work and returns true once completion is Cancelled and no engine
+	 * owns its buffers. False leaves Idle/already-completed work unchanged. Cancellation
+	 * is not rollback of OUT bytes already acknowledged on the bus.
+	 */
+	public fn Cancel() bool
+	{
+		return controller.Cancel()
+	}
+
+	/**
+	 * Releases Complete state and all staged data; false leaves other states unchanged.
+	 */
+	public fn TryRelease() bool
+	{
+		return controller.TryRelease()
+	}
+}

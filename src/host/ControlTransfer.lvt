@@ -1,0 +1,85 @@
+namespace Livt.Usb.Host
+
+using Livt.Usb
+
+/**
+ * Scheduled standard/class request helper borrowing a single-owner controller.
+ * Completion remains retained for the caller to inspect and release. No class policy.
+ */
+component ControlTransfer
+{
+	// Borrowed transfer slot; caller serializes all uses with other transfers.
+	controller: IHostController
+
+	/**
+	 * The controller outlives this helper and shares its clock/reset context.
+	 */
+	new(controller: IHostController)
+	{
+		this.controller = controller
+	}
+
+	/**
+	 * Stages an eight-byte request and waits at most 500 frames for its completion.
+	 * Supports IN data or no-data requests; OUT payload uses IHostController directly.
+	 */
+	public fn Run(address: int, packetSize: int, requestType: byte, request: byte,
+		value: int, index: int, length: int) bool
+	{
+		if (controller.GetState() != TransferState.Idle) { return false }
+
+		controller.TryClearStaging()
+
+		for (var position: byte = 0; position < 8; position++) {
+			var valueByte: byte
+
+			match position
+			{
+				0 =>
+				{
+					valueByte = requestType
+				}
+				1 =>
+				{
+					valueByte = request
+				}
+				2 =>
+				{
+					valueByte = (value & 255) as byte
+				}
+				3 =>
+				{
+					valueByte = ((value >> 8) & 255) as byte
+				}
+				4 =>
+				{
+					valueByte = (index & 255) as byte
+				}
+				5 =>
+				{
+					valueByte = ((index >> 8) & 255) as byte
+				}
+				6 =>
+				{
+					valueByte = (length & 255) as byte
+				}
+				_ =>
+				{
+					valueByte = ((length >> 8) & 255) as byte
+				}
+			}
+
+			if (!controller.TryStageSetup(valueByte)) { return false }
+		}
+
+		var direction = TransferDirection.HostToDevice
+
+		if (length != 0) { direction = TransferDirection.DeviceToHost }
+
+		if (controller.TrySubmit(address, 0, TransferKind.Control, direction, packetSize, length, 500, 0) != SubmissionResult.Accepted) { return false }
+
+		while (controller.GetState() == TransferState.Active) {}
+
+		return controller.GetResult() == TransferResult.Success
+	}
+}

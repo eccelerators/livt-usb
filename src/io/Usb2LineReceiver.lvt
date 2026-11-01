@@ -1,0 +1,168 @@
+namespace Livt.Usb.IO
+
+using Livt.Usb
+
+/**
+ * Samples the USB pair in the inherited context and recovers a low/full-speed bit phase.
+ * Two input registers contain metastability; protocol qualification ignores short
+ * single-ended crossover intervals. GPIO sampling is not an analog differential PHY.
+ * The owner changes speed only while disabled or idle. No scheduled operations run
+ * in this path; public events describe the preceding clock's sampled pair.
+ */
+component Usb2LineReceiver
+{
+	// Exact USB bit periods; TicksFor currently rounds fractional-ns clock periods.
+	const CLOCK_HZ: uint = this.context.TicksPer(1Hz)
+	const FULL_BIT_TICKS: uint = this.context.TicksPer(12MHz)
+	const LOW_BIT_TICKS: uint = this.context.TicksPer(1500KHz)
+	const PHASE_BITS: int = Bits.RequiredFor(LOW_BIT_TICKS - 1)
+	const IDLE_BITS: int = Bits.RequiredFor(LOW_BIT_TICKS * 2)
+	const ZERO_BITS: int = Bits.RequiredFor(LOW_BIT_TICKS * 3 + 1)
+	const INVALID_TICKS: uint = (FULL_BIT_TICKS + 2) / 3
+	const INVALID_BITS: int = Bits.RequiredFor(INVALID_TICKS)
+
+	// Borrowed raw pad samples, selected speed and receive ownership.
+	dp: logic
+	dm: logic
+	speed: UsbSpeed
+	enabled: bool
+
+	// Pair synchronizer and edge/qualification history.
+	meta: logic[2]
+	sampledSpeed: UsbSpeed = UsbSpeed.Unknown
+	previous: logic[2]
+	phase: logic[PHASE_BITS]
+	idleCount: logic[IDLE_BITS]
+	zeroCount: logic[ZERO_BITS]
+	oneCount: logic[INVALID_BITS]
+
+	// Raw synchronized pair and qualified observations; bit 1 is D+.
+	public lineState: out logic[2]
+	public bitTick: out bool
+	public bitState: out logic[2]
+	public modeReady: out bool
+	public idle: out bool
+	public se0: out bool
+	public longSe0: out bool
+	public invalid: out bool
+
+	/**
+	 * Binds pad inputs in the inherited context, with integral samples per USB bit.
+	 * At least eight samples per full-speed bit are required.
+	 */
+	new(dp: logic, dm: logic, speed: UsbSpeed, enabled: bool)
+	{
+		assert CLOCK_HZ % 12000000 == 0, "USB PHY clock must be an exact multiple of 12 MHz"
+		assert FULL_BIT_TICKS >= 8, "USB PHY requires at least eight samples per full-speed bit"
+
+		this.dp = dp
+		this.dm = dm
+		this.speed = speed
+		this.enabled = enabled
+	}
+
+	/**
+	 * Prevents admission while a new speed is being initialized.
+	 */
+	process Mode[]()
+	{
+		modeReady = CLOCK_HZ % 12000000 == 0 && FULL_BIT_TICKS >= 8
+			&& enabled && speed == sampledSpeed && this.context.rst == 0b0
+	}
+
+	/**
+	 * Rephases on differential transitions and samples close to each bit center.
+	 * Short SE0 crossover intervals do not replace the last differential sample.
+	 */
+	process Sample()
+	{
+		state {
+			var observed = lineState
+			var oldMeta = meta
+			var raw: logic[2] = 0
+			raw[1] = dp
+			raw[0] = dm
+			meta = raw
+			lineState = oldMeta
+			bitTick = false
+			var j: logic[2]
+			j = 0b10
+			var idleLimit: logic[IDLE_BITS]
+			idleLimit = ((FULL_BIT_TICKS * 2) as int) as logic[IDLE_BITS]
+			var zeroLimit: logic[ZERO_BITS]
+			zeroLimit = ((FULL_BIT_TICKS * 3 + 1) as int) as logic[ZERO_BITS]
+			var zeroThreshold: logic[ZERO_BITS]
+			zeroThreshold = (((FULL_BIT_TICKS + 2) / 3) as int) as logic[ZERO_BITS]
+			var longThreshold: logic[ZERO_BITS]
+			longThreshold = ((FULL_BIT_TICKS * 3) as int) as logic[ZERO_BITS]
+			var centerPhase: logic[PHASE_BITS]
+			centerPhase = ((FULL_BIT_TICKS / 2 - 2) as int) as logic[PHASE_BITS]
+			var fullPhase: logic[PHASE_BITS]
+			fullPhase = ((FULL_BIT_TICKS - 1) as int) as logic[PHASE_BITS]
+
+			if (speed == UsbSpeed.Low) {
+				j = 0b01
+				idleLimit = ((LOW_BIT_TICKS * 2) as int) as logic[IDLE_BITS]
+				zeroLimit = ((LOW_BIT_TICKS * 3 + 1) as int) as logic[ZERO_BITS]
+				zeroThreshold = (((LOW_BIT_TICKS + 2) / 3) as int) as logic[ZERO_BITS]
+				longThreshold = ((LOW_BIT_TICKS * 3) as int) as logic[ZERO_BITS]
+				centerPhase = ((LOW_BIT_TICKS / 2 - 2) as int) as logic[PHASE_BITS]
+				fullPhase = ((LOW_BIT_TICKS - 1) as int) as logic[PHASE_BITS]
+			}
+
+			if (!enabled || speed != sampledSpeed || CLOCK_HZ % 12000000 != 0 || FULL_BIT_TICKS < 8) {
+				sampledSpeed = speed
+				phase = 0
+				previous = j
+				idleCount = 0
+				zeroCount = 0
+				oneCount = 0
+				idle = false
+				se0 = false
+				longSe0 = false
+				invalid = false
+			} else {
+				if (observed == j) {
+					if (idleCount < idleLimit) {
+						idleCount++
+					}
+				} else {
+					idleCount = 0
+				}
+
+				if (observed == 0) {
+					if (zeroCount < zeroLimit) {
+						zeroCount++
+					}
+				} else {
+					zeroCount = 0
+				}
+
+				if (observed == 3) {
+					if ((oneCount as uint) < INVALID_TICKS) {
+						oneCount++
+					}
+				} else {
+					oneCount = 0
+				}
+
+				idle = idleCount >= idleLimit
+				se0 = zeroCount >= zeroThreshold
+				longSe0 = zeroCount >= longThreshold
+				invalid = (oneCount as uint) >= INVALID_TICKS
+				var differential = observed == 1 || observed == 2
+
+				if (differential && observed != previous) {
+					phase = centerPhase
+					previous = observed
+				} elif (phase == 0) {
+					bitTick = true
+					bitState = previous
+					phase = fullPhase
+				} else {
+					phase--
+				}
+			}
+		}
+	}
+}

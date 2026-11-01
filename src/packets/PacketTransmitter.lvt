@@ -1,0 +1,235 @@
+namespace Livt.Usb.Packets
+
+using Livt.IO
+using Livt.Usb
+using Livt.Utils.Hashing
+
+/**
+ * Builds complete packets from a staged payload or token/handshake command.
+ * Single-clock signal handshakes: loadValid/loadReady appends, request/ready
+ * submits. No load is accepted with clear or request asserted. Staging is frozen
+ * during transmission. Completion follows PHY busy falling, not last-byte acceptance.
+ * The PHY must pace bytes as IUsb2Phy does (at least 64 clocks between accepts).
+ */
+component PacketTransmitter<CAPACITY: int = 64, STYLE: MemoryStyle = MemoryStyle.Block,
+	B: ISynchronousRam<byte, uint, RamGeometry<CAPACITY>> & new() = SynchronousRam<byte, uint, CAPACITY, STYLE>>
+{
+	static assert CAPACITY > 0 && CAPACITY <= 1023, "Packet capacity must be 1 through 1023"
+
+	// Packet phases; fetch occurs before PID so an active wire stream never stalls.
+	const IDLE: logic[4] = 0
+	const FETCH: logic[4] = 1
+	const PID: logic[4] = 2
+	const PAYLOAD: logic[4] = 3
+	const CRC_LOW: logic[4] = 4
+	const CRC_HIGH: logic[4] = 5
+	const TOKEN_LOW: logic[4] = 6
+	const TOKEN_HIGH: logic[4] = 7
+	const FINISH: logic[4] = 8
+
+	// Owned storage/checksum helpers and borrowed PHY handshake.
+	storage: B
+	crc5: Crc<5, 0x05, true>
+	crc16: Crc<16, 0x8005, true>
+	public speed: in UsbSpeed
+	public cancel: in bool
+	public phyReady: in bool
+	public phyBusy: in bool
+
+	// Staging and in-flight state; RAM cells are not reset.
+	phase: logic[4]
+	count: logic[11]
+	index: logic[10]
+	savedPid: byte
+	tokenWord: logic[16]
+	checksum: logic[16] = PacketIntegrity.DATA_INITIAL
+	payload: byte
+	sampledSpeed: UsbSpeed
+
+	// One owner publishes byte and valid together through live combinational outputs.
+	wireData: byte
+	wireValid: bool
+
+	// Application/transaction owner controls and admission signals.
+	public clear: in bool
+	public loadValid: in bool
+	public loadData: in byte
+	public loadReady: out bool
+	public stagedLength: out uint
+	public request: in bool
+	public pid: in byte
+	public token: in logic[11]
+	public ready: out bool
+	public busy: out bool
+	public completed: out bool
+	public rejected: out bool
+
+	// Wire byte stream: PID and CRC included, SYNC/EOP supplied by PHY.
+	public txValid: out bool
+	public txData: out byte
+
+	/**
+	 * Binds a shared clock; cancel must also cancel the attached PHY.
+	 */
+	new()
+	{
+		storage = new B()
+		crc5 = new Crc<5, 0x05, true>()
+		crc16 = new Crc<16, 0x8005, true>()
+	}
+
+	/**
+	 * Drives admission, memory prefetch and a continuous stream until intentional EOP.
+	 */
+	process Ports[]()
+	{
+		var enabled = !cancel && this.context.rst == 0b0
+		ready = enabled && phase == IDLE && !clear && !phyBusy
+		loadReady = ready && !request && (count as uint) < (CAPACITY as uint)
+		stagedLength = count as uint
+		busy = phase != IDLE && enabled
+		txValid = wireValid && enabled
+		txData = wireData
+
+		storage.enable = false
+		storage.writeEnable = false
+		storage.address = 0
+		storage.writeData = loadData
+
+		if (enabled) {
+			if (loadValid && loadReady) {
+				storage.enable = true
+				storage.writeEnable = true
+				storage.address = count as uint
+			} elif (request && ready && PacketPid.IsData(pid) && count != 0) {
+				storage.enable = true
+			} elif ((phase == PID || phase == PAYLOAD) && PacketPid.IsData(savedPid)
+				&& (index as uint) + 1 < (count as uint)) {
+				storage.enable = true
+				storage.address = (index as uint) + 1
+			}
+		}
+	}
+
+	/**
+	 * Captures requests and advances CRC only on an accepted payload byte.
+	 */
+	process Transmit()
+	{
+		state {
+			completed = false
+			rejected = false
+
+			if (cancel || (phase != IDLE && speed != sampledSpeed)) {
+				phase = IDLE
+				count = 0
+			} elif (phase == IDLE) {
+				if (clear) {
+					count = 0
+				} elif (request && ready) {
+					var supported = PacketPid.IsToken(pid) || PacketPid.IsData(pid) || PacketPid.IsHandshake(pid)
+
+					if (!supported || (speed != UsbSpeed.Full && speed != UsbSpeed.Low)
+						|| (speed == UsbSpeed.Low && (pid == PacketPid.SOF || (PacketPid.IsData(pid) && (count as uint) > PacketIntegrity.LOW_SPEED_PAYLOAD_LIMIT)))) {
+						rejected = true
+					} else {
+						savedPid = pid
+						sampledSpeed = speed
+						index = 0
+						checksum = PacketIntegrity.DATA_INITIAL
+						var check = crc5.UpdateBits(PacketIntegrity.TOKEN_INITIAL, token as uint, PacketIntegrity.TOKEN_BITS)
+							^ PacketIntegrity.TOKEN_FINAL_XOR
+						tokenWord = TokenCodec.Pack(token, check)
+						phase = PID
+
+						if (PacketPid.IsData(pid) && count != 0) {
+							phase = FETCH
+						}
+					}
+				} elif (loadValid && loadReady) {
+					count++
+				}
+			} elif (phase == FETCH) {
+				payload = storage.readData
+				phase = PID
+			} elif (phase == FINISH) {
+				if (!phyBusy) {
+					completed = true
+					phase = IDLE
+
+					if (PacketPid.IsData(savedPid)) {
+						count = 0
+					}
+				}
+			} elif (txValid && phyReady) {
+				match phase
+				{
+					PID =>
+					{
+						phase = FINISH
+
+						if (PacketPid.IsToken(savedPid)) {
+							phase = TOKEN_LOW
+						} elif (PacketPid.IsData(savedPid)) {
+							phase = CRC_LOW
+
+							if (count != 0) {
+								phase = PAYLOAD
+							}
+						}
+					}
+					PAYLOAD =>
+					{
+						checksum = crc16.UpdateByte(checksum, payload)
+						payload = storage.readData
+						index++
+
+						if ((index as uint) >= (count as uint)) {
+							phase = CRC_LOW
+						}
+					}
+					CRC_LOW =>
+					{
+						phase = CRC_HIGH
+					}
+					TOKEN_LOW =>
+					{
+						phase = TOKEN_HIGH
+					}
+					_ =>
+					{
+						phase = FINISH
+					}
+				}
+			}
+
+			wireValid = !cancel && phase >= PID && phase <= TOKEN_HIGH
+			wireData = savedPid
+
+			match phase
+			{
+				PAYLOAD =>
+				{
+					wireData = payload
+				}
+				CRC_LOW =>
+				{
+					wireData = ((checksum ^ PacketIntegrity.DATA_FINAL_XOR) & 0xFF) as byte
+				}
+				CRC_HIGH =>
+				{
+					wireData = ((checksum ^ PacketIntegrity.DATA_FINAL_XOR) >> 8) as byte
+				}
+				TOKEN_LOW =>
+				{
+					wireData = (tokenWord & 0xFF) as byte
+				}
+				TOKEN_HIGH =>
+				{
+					wireData = (tokenWord >> 8) as byte
+				}
+				_ => {}
+			}
+		}
+	}
+}

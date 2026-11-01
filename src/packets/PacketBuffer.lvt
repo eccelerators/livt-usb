@@ -1,0 +1,115 @@
+namespace Livt.Usb.Packets
+
+using Livt.IO
+
+/**
+ * Owns a bounded packet payload with an initialized prefix and publication state.
+ * One caller serializes scheduled operations in the inherited clock/reset context.
+ * Readers borrow the published bytes until Clear; finish reads before clearing.
+ * Reset cancels work and invalidates metadata, regardless of backend payload reset.
+ * Calls may take multiple cycles; this is not a wire-rate PHY storage interface.
+ */
+component PacketBuffer<PAYLOAD_CAPACITY: int = 64, STYLE: MemoryStyle = MemoryStyle.Block,
+	B: IRam<byte> & new() = Ram<byte, PAYLOAD_CAPACITY, STYLE>>
+{
+	static assert PAYLOAD_CAPACITY > 0, "Packet buffer capacity must be positive"
+
+	// Configured payload capacity in bytes, excluding PID and CRC.
+	public const BYTE_CAPACITY: int = PAYLOAD_CAPACITY
+
+	// Owned backend; style applies only to the default RAM implementation.
+	storage: B
+
+	// Only bytes below length are initialized; publication freezes the prefix.
+	const LENGTH_BITS: int = Bits.RequiredFor(PAYLOAD_CAPACITY)
+	length: logic[LENGTH_BITS]
+	ready: bool
+
+	/**
+	 * Creates empty storage. B must provide byte addresses 0 through PAYLOAD_CAPACITY-1.
+	 * Unwritten backend bytes are never exposed; no payload initialization is needed.
+	 */
+	new()
+	{
+		storage = new B()
+	}
+
+	/**
+	 * Returns the initialized prefix length in bytes, including before publication.
+	 * This snapshot does not reserve storage or authorize a read before publication.
+	 */
+	public fn GetLength() int
+	{
+		return (length as uint) as int
+	}
+
+	/**
+	 * Reports whether the initialized prefix is published, including an empty payload.
+	 */
+	public fn IsReady() bool
+	{
+		return ready
+	}
+
+	/**
+	 * Appends one byte and returns true after its write commits. Returns false without
+	 * changing state when published, full, or the backend cannot address the next byte.
+	 */
+	public fn TryAppend(value: byte) bool
+	{
+		var index = (length as uint) as int
+
+		if (ready || index >= PAYLOAD_CAPACITY) {
+			return false
+		}
+
+		if (!storage.IsValidAddress(index)) {
+			return false
+		}
+
+		storage.Write(index, value)
+		length++
+		return true
+	}
+
+	/**
+	 * Publishes the initialized prefix, including zero bytes. Returns false if already
+	 * published. The owner must validate packet integrity before publishing RX data.
+	 */
+	public fn TryPublish() bool
+	{
+		if (ready) {
+			return false
+		}
+
+		ready = true
+		return true
+	}
+
+	/**
+	 * Reads a published byte at index in 0..GetLength()-1 and returns true on completion.
+	 * Returns false with value zero for unpublished data or an out-of-prefix index.
+	 * The caller must retain publication until the scheduled read finishes.
+	 */
+	public fn TryRead(index: int, value: out byte) bool
+	{
+		value = 0
+
+		if (!ready || index < 0 || index >= ((length as uint) as int)) {
+			return false
+		}
+
+		value = storage.Read(index)
+		return true
+	}
+
+	/**
+	 * Discards publication and the initialized prefix without erasing payload storage.
+	 * The owner must finish all borrowed reads first. The next append starts at zero.
+	 */
+	public fn Clear()
+	{
+		ready = false
+		length = 0
+	}
+}

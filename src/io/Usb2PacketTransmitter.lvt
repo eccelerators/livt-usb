@@ -1,0 +1,171 @@
+namespace Livt.Usb.IO
+
+using Livt.Usb
+
+/**
+ * Serializes an uninterrupted byte stream into low/full-speed USB signaling.
+ * Ready is an edge handshake; valid dropping at a byte boundary requests EOP.
+ * Stuffing includes SYNC's last one and a required stuffed bit before EOP.
+ * Busy remains true for two SE0 bits and one driven J bit before pad release.
+ */
+component Usb2PacketTransmitter
+{
+	// Constant bit periods and EOP counter geometry follow the inherited context.
+	const CLOCK_HZ: uint = this.context.TicksPer(1Hz)
+	const FULL_BIT_TICKS: uint = this.context.TicksPer(12MHz)
+	const LOW_BIT_TICKS: uint = this.context.TicksPer(1500KHz)
+	const COUNT_BITS: int = Bits.RequiredFor(LOW_BIT_TICKS * 2 - 1)
+
+	// Wire phases; this component is the single owner of its serializer state.
+	const IDLE: logic[3] = 0
+	const SYNC: logic[3] = 1
+	const DATA: logic[3] = 2
+	const END_ZERO: logic[3] = 3
+	const END_J: logic[3] = 4
+
+	// Borrowed stream and admission/cancellation signals.
+	speed: UsbSpeed
+	allowStart: bool
+	cancel: bool
+	txValid: bool
+	txData: byte
+	keepAlive: bool
+
+	// Selected packet timing, serialization and continuity across byte boundaries.
+	phase: logic[3]
+	count: logic[COUNT_BITS]
+	ticks: logic[COUNT_BITS]
+	j: logic[2] = 0b10
+	first: logic[8]
+	shift: logic[8]
+	bitIndex: logic[3]
+	ones: logic[3]
+	needByte: bool
+	level: logic[2]
+
+	// Combinational edge admission and registered-state wire outputs.
+	public ready: out bool
+	public keepAliveReady: out bool
+	public busy: out bool
+	public output: out logic[2]
+	public enable: out bool
+
+	/**
+	 * Binds a same-context producer with no pauses inside a packet; cancel aborts locally.
+	 */
+	new(speed: UsbSpeed, allowStart: bool, cancel: bool,
+		txValid: bool, txData: byte, keepAlive: bool)
+	{
+		assert CLOCK_HZ % 12000000 == 0, "USB PHY clock must be an exact multiple of 12 MHz"
+		assert FULL_BIT_TICKS >= 8, "USB PHY requires at least eight samples per full-speed bit"
+
+		this.speed = speed
+		this.allowStart = allowStart
+		this.cancel = cancel
+		this.txValid = txValid
+		this.txData = txData
+		this.keepAlive = keepAlive
+	}
+
+	/**
+	 * Presents edge-level handshakes and suppresses all drive during context reset.
+	 */
+	process Ports[]()
+	{
+		var available = CLOCK_HZ % 12000000 == 0 && FULL_BIT_TICKS >= 8
+			&& !cancel && this.context.rst == 0b0
+		ready = available && ((phase == IDLE && allowStart)
+			|| (phase == DATA && needByte && count == 0 && ones != 6))
+		keepAliveReady = available && phase == IDLE && allowStart
+			&& speed == UsbSpeed.Low && !txValid
+		busy = phase != IDLE && available
+		output = level
+		enable = phase != IDLE && available
+	}
+
+	/**
+	 * Advances only on bit boundaries; no scheduled calls can alter wire timing.
+	 */
+	process Serialize()
+	{
+		state {
+			if (cancel) {
+				phase = IDLE
+				count = 0
+				needByte = false
+			} elif (phase == IDLE) {
+				if ((ready && txValid) || (keepAliveReady && keepAlive)) {
+					ticks = (FULL_BIT_TICKS as int) as logic[COUNT_BITS]
+					j = 0b10
+
+					if (speed == UsbSpeed.Low) {
+						ticks = (LOW_BIT_TICKS as int) as logic[COUNT_BITS]
+						j = 0b01
+					}
+
+					level = j
+					count = 0
+					ones = 0
+					bitIndex = 0
+					needByte = false
+					first = txData as logic[8]
+					shift = 0x80
+					phase = SYNC
+
+					if (!txValid) {
+						phase = END_ZERO
+						level = 0
+						count = (((ticks as uint) * 2 - 1) as int) as logic[COUNT_BITS]
+					}
+				}
+			} elif (count != 0) {
+				count--
+			} elif (phase == END_ZERO) {
+				phase = END_J
+				level = j
+				count = (((ticks as uint) - 1) as int) as logic[COUNT_BITS]
+			} elif (phase == END_J) {
+				phase = IDLE
+			} else {
+				count = (((ticks as uint) - 1) as int) as logic[COUNT_BITS]
+
+				if (ones == 6) {
+					level = level ^ 0b11
+					ones = 0
+				} elif (phase == DATA && needByte && !txValid) {
+					phase = END_ZERO
+					level = 0
+					count = (((ticks as uint) * 2 - 1) as int) as logic[COUNT_BITS]
+				} else {
+					if (phase == DATA && needByte) {
+						shift = txData as logic[8]
+						bitIndex = 0
+						needByte = false
+					}
+
+					if ((shift & 1) == 0) {
+						level = level ^ 0b11
+						ones = 0
+					} else {
+						ones++
+					}
+
+					shift = shift >> 1
+
+					if (bitIndex == 7) {
+						bitIndex = 0
+
+						if (phase == SYNC) {
+							phase = DATA
+							shift = first
+						} else {
+							needByte = true
+						}
+					} else {
+						bitIndex++
+					}
+				}
+			}
+		}
+	}
+}

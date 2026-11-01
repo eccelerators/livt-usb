@@ -1,0 +1,212 @@
+namespace Livt.Usb.Hid
+
+using Livt.Usb
+using Livt.Usb.Host
+
+/**
+ * Direct boot-keyboard lifecycle and interrupt polling, independent of terminal speed.
+ * Owns the controller's sole scheduled client. Exposes a bounded queue of HID usage
+ * transitions; application owns layout, text, repeat and LEDs. No hub/report protocol.
+ */
+component BootKeyboardHost : IKeyboardSource
+{
+	// Borrowed controller and owned discovery, class setup, report parser and queue.
+	controller: IHostController
+	enumerator: DeviceEnumerator
+	control: ControlTransfer
+	parser: BootKeyboardReportParser
+	events: KeyboardEventQueue
+	status: byte
+	dropped: uint
+	badReports: uint
+	endpoint: byte
+	packetSize: byte
+	interval: byte
+	interfaceNumber: byte
+	reports: byte
+	// Low to high bytes: endpoint, packet size, interval, successful report count.
+	public diagnostics: out logic[32]
+	// Valid after binding: VID/PID; configuration, EP0 size, interface and endpoint.
+	public identity: out logic[32]
+	public binding: out logic[32]
+
+	/**
+	 * Starts discovery automatically after the controller reports a recovered port.
+	 */
+	new(controller: IHostController)
+	{
+		this.controller = controller
+		enumerator = new DeviceEnumerator(controller)
+		control = new ControlTransfer(controller)
+		parser = new BootKeyboardReportParser()
+		events = new KeyboardEventQueue()
+	}
+
+	/**
+	 * Exposes binding and an eight-bit wrapping report count without scheduled access.
+	 */
+	process Diagnostics[]()
+	{
+		diagnostics = (endpoint as logic[32]) | ((packetSize as logic[32]) << 8)
+			| ((interval as logic[32]) << 16) | ((reports as logic[32]) << 24)
+		identity = enumerator.identity
+		binding = (enumerator.configurationValue as logic[32]) | ((enumerator.packetBytes as logic[32]) << 8)
+			| ((interfaceNumber as logic[32]) << 16) | ((endpoint as logic[32]) << 24)
+	}
+
+	/**
+	 * Status: 0 disconnected, 1 enumerating, 2 unsupported/error, 3 class setup,
+	 * 4 polling, 5 stalled/failed. Enumeration phase is available separately.
+	 */
+	override fn GetStatus() byte
+	{
+		return status
+	}
+
+	/**
+	 * Returns the standard discovery phase, useful for failed-device diagnostics.
+	 */
+	override fn GetPhase() byte
+	{
+		return enumerator.GetPhase()
+	}
+
+	/**
+	 * Returns the number of dropped events; overflow never blocks USB polling.
+	 */
+	override fn GetDropped() uint
+	{
+		return dropped
+	}
+
+	/**
+	 * Returns rejected boot report count, including rollover and invalid lengths.
+	 */
+	override fn GetBadReports() uint
+	{
+		return badReports
+	}
+
+	/**
+	 * Removes one transition. One consumer serializes calls and retains it under
+	 * UART backpressure. Bit 17 marks disconnect; inspect GetDropped for losses.
+	 */
+	override fn TryReadEvent(value: out logic[18]) bool
+	{
+		return events.TryDequeue(value)
+	}
+
+	/**
+	 * Drains parser transitions into the bounded queue and counts any loss.
+	 */
+	fn Publish()
+	{
+		var value: logic[18]
+
+		while (parser.Next(value)) {
+			if (!events.TryEnqueue(value)) { dropped++ }
+		}
+	}
+
+	/**
+	 * Selects the first eligible alternate-zero HID boot-keyboard interrupt IN endpoint.
+	 * Device-specific auxiliary-interface exclusions are isolated in BootKeyboardBinding.
+	 */
+	fn Bind() bool
+	{
+		for (var index: byte = 0; index < 3; index++) {
+			if (enumerator.GetEndpoint(index as int, 0) >= 128 && enumerator.GetEndpoint(index as int, 1) == 3
+				&& enumerator.GetEndpoint(index as int, 5) == 3 && enumerator.GetEndpoint(index as int, 6) == 1
+				&& enumerator.GetEndpoint(index as int, 7) == 1 && enumerator.GetEndpoint(index as int, 2) >= 8
+				&& BootKeyboardBinding.AcceptsInterface(identity, enumerator.GetEndpoint(index as int, 4))) {
+				endpoint = (enumerator.GetEndpoint(index as int, 0) & 15) as byte
+				packetSize = enumerator.GetEndpoint(index as int, 2) as byte
+				interval = enumerator.GetEndpoint(index as int, 3) as byte
+				interfaceNumber = enumerator.GetEndpoint(index as int, 4) as byte
+				return true
+			}
+		}
+
+		return false
+	}
+
+	/**
+	 * Runs standard discovery then HID SET_PROTOCOL(boot) and SET_IDLE(0).
+	 * A STALL requires reconnect/reset; no unbounded request or busy polling retries.
+	 */
+	process Run()
+	{
+		// This report is private to the lifecycle worker; every byte is filled before use.
+		var report: byte[8]
+		status = 0
+		reports = 0
+		parser.Reset()
+
+		while (!controller.IsConnected()) {}
+
+		status = 1
+		var ready = enumerator.Enumerate()
+
+		if (ready) {
+			ready = Bind()
+		}
+
+		status = 2
+
+		if (ready) {
+			status = 3
+			ready = control.Run(1, enumerator.GetPacketSize(), 33, 11, 0, interfaceNumber as int, 0)
+			controller.TryRelease()
+
+			if (ready) {
+				ready = control.Run(1, enumerator.GetPacketSize(), 33, 10, 0, interfaceNumber as int, 0)
+				controller.TryRelease()
+			}
+		}
+
+		if (ready) { status = 4 } else { status = 2 }
+
+		while (ready && controller.IsConnected()) {
+			controller.TryClearStaging()
+			var submission = controller.TrySubmit(1, endpoint as int, TransferKind.Interrupt,
+				TransferDirection.DeviceToHost, packetSize as int, 8, 500, interval as int)
+
+			if (submission == SubmissionResult.Accepted) {
+				while (controller.GetState() == TransferState.Active) {}
+
+				var result = controller.GetResult()
+
+				if (result == TransferResult.Success) {
+					reports++
+
+					if (controller.GetActualLength() == 8) {
+						for (var index: byte = 0; index < 8; index++) {
+							var value: byte
+							controller.TryReadInput(index as int, value)
+							report[index as int] = value
+						}
+
+						if (parser.Accept(report)) { Publish() } else { badReports++ }
+					} else { badReports++ }
+				} elif (result != TransferResult.Timeout && result != TransferResult.Disconnected) {
+					ready = false;
+					status = 5
+				}
+
+				controller.TryRelease()
+			}
+		// The controller enforces bInterval across submissions and retries.
+		}
+
+		while (controller.IsConnected()) {}
+
+		for (var index: byte = 0; index < 8; index++) {
+			report[index as int] = 0
+		}
+
+		parser.Accept(report)
+		Publish()
+
+		if (!events.TryEnqueue(131072)) { dropped++ }
+	}
+}

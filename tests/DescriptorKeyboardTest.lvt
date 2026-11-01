@@ -1,0 +1,174 @@
+namespace Livt.Usb.Tests
+
+using Livt.IO
+using Livt.Usb
+using Livt.Usb.Descriptors
+using Livt.Usb.Hid
+
+/**
+ * Descriptor bounds, report transitions and queue loss/backpressure regressions.
+ */
+@Test
+component DescriptorKeyboardTest
+{
+	configuration: ConfigurationDescriptorParser
+	freshParser: BootKeyboardReportParser
+	arrayParser: BootKeyboardReportParser<ArrayRam<byte, 16>>
+	parser: BootKeyboardReportParser
+	queue: KeyboardEventQueue<2, MemoryStyle.Distributed>
+
+	/**
+	 * Owns deliberately small queue and independent parsers.
+	 */
+	new()
+	{
+		configuration = new ConfigurationDescriptorParser()
+		freshParser = new BootKeyboardReportParser()
+		arrayParser = new BootKeyboardReportParser<ArrayRam<byte, 16>>()
+		parser = new BootKeyboardReportParser()
+		queue = new KeyboardEventQueue<2, MemoryStyle.Distributed>()
+	}
+
+	/**
+	 * Discovers a non-default interface/endpoint and rejects truncation/invalid length.
+	 */
+	@Test
+	fn BoundsConfiguration()
+	{
+		var descriptor: byte[34] = [9, 2, 34, 0, 1, 7, 0, 128, 50, 9, 4, 2, 0, 1, 3, 1, 1, 0, 9, 33, 17, 1, 0, 1, 34, 63, 0, 7, 5, 131, 3, 8, 0, 10]
+		configuration.Reset()
+
+		for (var index = 0; index < 33; index++) {
+			configuration.Feed(descriptor[index])
+		}
+
+		assert !configuration.IsValid(UsbSpeed.Full)
+		configuration.Feed(descriptor[33])
+		assert configuration.IsValid(UsbSpeed.Full)
+		assert configuration.IsValid(UsbSpeed.Low)
+		assert configuration.GetConfiguration() == 7
+		assert configuration.GetEndpoint(0, 0) == 131
+		assert configuration.GetEndpoint(0, 4) == 2
+		assert configuration.GetEndpoint(0, 3) == 10
+		assert configuration.GetEndpoint(1, 0) == -1
+		configuration.Feed(0)
+		assert !configuration.IsValid(UsbSpeed.Full)
+		configuration.Reset()
+		configuration.Feed(1)
+		assert configuration.GetTotalLength() == 0
+	}
+
+	/**
+	 * Repeated and duplicate keys do not repeat; rollover preserves held state.
+	 */
+	@Test
+	fn DecodesTransitions()
+	{
+		parser.Reset()
+		var report: byte[8] = [2, 0, 4, 4, 0, 0, 0, 0]
+		var event: logic[18]
+		assert parser.Accept(report)
+		assert parser.Next(event) && event == 0x102E1
+		assert parser.Next(event) && event == 0x10204
+		assert !parser.Next(event)
+		assert parser.Accept(report)
+		assert !parser.Next(event)
+		report[2] = 1
+		assert !parser.Accept(report)
+		report[0] = 0;
+		report[2] = 0;
+		report[3] = 0
+		assert parser.Accept(report)
+		assert parser.Next(event) && event == 0xE1
+		assert parser.Next(event) && event == 4
+		assert !parser.Next(event)
+	}
+
+	/**
+	 * Full queues preserve existing events, reject the new event, and recover on drain.
+	 */
+	@Test
+	fn RetainsQueueUnderBackpressure()
+	{
+		var event: logic[18]
+		assert !queue.TryDequeue(event) && event == 0
+		assert queue.TryEnqueue(0x10004)
+		assert queue.TryEnqueue(4)
+		assert !queue.TryEnqueue(5)
+		assert queue.TryDequeue(event) && event == 0x10004
+		assert queue.TryEnqueue(6)
+		assert queue.TryDequeue(event) && event == 4
+		assert queue.TryDequeue(event) && event == 6
+		assert !queue.TryDequeue(event)
+	}
+
+	/**
+	 * Report snapshots support a register-array provider with identical transitions.
+	 */
+	@Test
+	fn ReportStorageParity()
+	{
+		parser.Reset()
+		arrayParser.Reset()
+		var report: byte[8] = [3, 0, 4, 5, 5, 6, 0, 0]
+		assert parser.Accept(report) && arrayParser.Accept(report)
+
+		for (var index = 0; index < 6; index++) {
+			var blockEvent: logic[18]
+			var arrayEvent: logic[18]
+			assert parser.Next(blockEvent) == arrayParser.Next(arrayEvent)
+			assert blockEvent == arrayEvent
+		}
+
+		report[2] = 1
+		assert !parser.Accept(report) && !arrayParser.Accept(report)
+
+		for (var index = 0; index < 8; index++) {
+			report[index] = 0
+		}
+
+		assert parser.Accept(report) && arrayParser.Accept(report)
+
+		for (var index = 0; index < 6; index++) {
+			var blockEvent: logic[18]
+			var arrayEvent: logic[18]
+			assert parser.Next(blockEvent) == arrayParser.Next(arrayEvent)
+			assert blockEvent == arrayEvent
+		}
+	}
+
+	/**
+	 * First use and logical reset never expose unwritten or retained report cells.
+	 */
+	@Test
+	fn StartsEmptyAndDiscardsRetainedCells()
+	{
+		var event: logic[18]
+		assert !freshParser.Next(event) && event == 0
+		var report: byte[8] = [0, 0, 4, 0, 0, 0, 0, 0]
+		assert freshParser.Accept(report)
+		assert freshParser.Next(event) && event == 0x10004
+		assert !freshParser.Next(event)
+		freshParser.Reset()
+		assert !freshParser.Next(event) && event == 0
+		report[2] = 5
+		assert freshParser.Accept(report)
+		assert freshParser.Next(event) && event == 0x10005
+		assert !freshParser.Next(event)
+	}
+
+	/**
+	 * Skips only the documented auxiliary interfaces, preserving ordinary keyboards.
+	 */
+	@Test
+	fn SelectsKnownReceiverKeyboardInterfaces()
+	{
+		assert !BootKeyboardBinding.AcceptsInterface(0x24AE2010, 1)
+		assert !BootKeyboardBinding.AcceptsInterface(0x24AE2013, 1)
+		assert BootKeyboardBinding.AcceptsInterface(0x24AE2010, 2)
+		assert BootKeyboardBinding.AcceptsInterface(0x24AE2013, 2)
+		assert BootKeyboardBinding.AcceptsInterface(0x12345678, 1)
+		assert BootKeyboardBinding.AcceptsInterface(0x24AE2015, 1)
+		assert BootKeyboardBinding.AcceptsInterface(0x24AE2010, 0)
+	}
+}

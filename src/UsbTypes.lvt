@@ -1,0 +1,71 @@
+namespace Livt.Usb
+
+/**
+ * Observed device speed; Unknown represents no established connection.
+ * High is expressible but unsupported by the initial low/full-speed profile.
+ */
+enum UsbSpeed
+{
+	Unknown
+	Low
+	Full
+	High
+}
+
+/**
+ * USB endpoint transfer type, independent of device class or connector shape.
+ */
+enum TransferKind
+{
+	Control
+	Interrupt
+	Bulk
+	Isochronous
+}
+
+/**
+ * Direction of the data stage, not the setup or control-status stage.
+ */
+enum TransferDirection
+{
+	HostToDevice
+	DeviceToHost
+}
+
+/**
+ * Submission outcome. Accepted reserves the single slot, not transfer success.
+ */
+enum SubmissionResult
+{
+	Accepted
+	Busy
+	Disconnected
+	Unsupported
+	Invalid
+}
+
+/**
+ * Single-slot lifecycle; Complete retains its result until explicit release.
+ */
+enum TransferState
+{
+	Idle
+	Active
+	Complete
+}
+
+/**
+ * Terminal transfer outcome. Pending is returned until a completion is retained.
+ * NAK is a retry condition, not a terminal status; the deadline bounds retries.
+ */
+enum TransferResult
+{
+	Pending
+	Success
+	Stall
+	Timeout
+	Disconnected
+	Cancelled
+	ProtocolError
+	Overflow
+}

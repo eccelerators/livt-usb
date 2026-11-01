@@ -1,0 +1,137 @@
+namespace Livt.Usb.Tests
+
+using Livt.IO
+using Livt.Usb.Packets
+
+/**
+ * Compares the default block-style and resettable logic-array backends at 64 bytes.
+ * Each test clears metadata explicitly; no test depends on unwritten payload values.
+ */
+@Test
+component PacketBufferTest
+{
+	// Independent implementations receiving the same serialized operations.
+	block: PacketBuffer
+	array: PacketBuffer<64, MemoryStyle.Block, ArrayRam<byte, 64>>
+
+	/**
+	 * Owns both buffers in the inherited test context.
+	 */
+	new()
+	{
+		block = new PacketBuffer()
+		array = new PacketBuffer<64, MemoryStyle.Block, ArrayRam<byte, 64>>()
+	}
+
+	/**
+	 * Verifies every byte, bounds, immutable publication and shorter reuse on both stores.
+	 */
+	@Test
+	fn PreservesPayloadAndPublicationAcrossBackends()
+	{
+		block.Clear()
+		array.Clear()
+		var blockByte: byte = 0xFF
+		var arrayByte: byte = 0xFF
+		assert !block.TryRead(0, blockByte)
+		assert !array.TryRead(0, arrayByte)
+		assert blockByte == 0
+		assert arrayByte == 0
+
+		for (var i = 0; i < 64; i++) {
+			var expected = ((i * 37 + 128) % 256) as byte
+			assert block.TryAppend(expected)
+			assert array.TryAppend(expected)
+		}
+
+		assert block.GetLength() == 64
+		assert array.GetLength() == 64
+		assert !block.TryAppend(0xEE)
+		assert !array.TryAppend(0xEE)
+		assert block.TryPublish()
+		assert array.TryPublish()
+		assert !block.TryPublish()
+		assert !array.TryPublish()
+		assert !block.TryAppend(0xEE)
+		assert !array.TryAppend(0xEE)
+
+		for (var i = 63; i >= 0; i--) {
+			var expected = ((i * 37 + 128) % 256) as byte
+			assert block.TryRead(i, blockByte)
+			assert array.TryRead(i, arrayByte)
+			assert blockByte == expected
+			assert arrayByte == expected
+		}
+
+		assert !block.TryRead(-1, blockByte)
+		assert !array.TryRead(-1, arrayByte)
+		assert !block.TryRead(64, blockByte)
+		assert !array.TryRead(64, arrayByte)
+		assert blockByte == 0
+		assert arrayByte == 0
+		block.Clear()
+		array.Clear()
+		assert !block.IsReady()
+		assert !array.IsReady()
+		assert block.TryAppend(0x42)
+		assert array.TryAppend(0x42)
+		assert block.TryPublish()
+		assert array.TryPublish()
+		assert !block.TryAppend(0xEE)
+		assert !array.TryAppend(0xEE)
+		assert block.GetLength() == 1
+		assert array.GetLength() == 1
+		assert block.TryRead(0, blockByte)
+		assert array.TryRead(0, arrayByte)
+		assert blockByte == 0x42
+		assert arrayByte == 0x42
+		assert !block.TryRead(1, blockByte)
+		assert !array.TryRead(1, arrayByte)
+		assert blockByte == 0
+		assert arrayByte == 0
+	}
+
+	/**
+	 * Empty publication is distinguishable from an unpublished buffer on both stores.
+	 */
+	@Test
+	fn PublishesZeroLengthPayloadWithoutReadingStorage()
+	{
+		block.Clear()
+		array.Clear()
+		assert block.TryPublish()
+		assert array.TryPublish()
+		assert block.IsReady()
+		assert array.IsReady()
+		assert block.GetLength() == 0
+		assert array.GetLength() == 0
+		var value: byte = 0xFF
+		assert !block.TryRead(0, value)
+		assert value == 0
+		assert !array.TryRead(0, value)
+		assert value == 0
+	}
+
+	/**
+	 * Partially staged data stays private and can be discarded before publication.
+	 */
+	@Test
+	fn DiscardsIncompletePayload()
+	{
+		block.Clear()
+		array.Clear()
+		assert block.TryAppend(0xA5)
+		assert array.TryAppend(0xA5)
+		var value: byte = 0xFF
+		assert !block.TryRead(0, value)
+		assert !array.TryRead(0, value)
+		block.Clear()
+		array.Clear()
+		assert block.GetLength() == 0
+		assert array.GetLength() == 0
+		assert block.TryPublish()
+		assert array.TryPublish()
+		assert !block.TryRead(0, value)
+		assert !array.TryRead(0, value)
+	}
+}

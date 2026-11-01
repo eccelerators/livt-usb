@@ -1,0 +1,139 @@
+namespace Livt.Usb.Host
+
+using Livt.Usb
+
+/**
+ * One directly attached USB port with context-derived timing. Debounces for 100 ms,
+ * drives reset for 12 ms and permits transfers after 10 ms recovery. Frame time
+ * runs during recovery. SE0 lasting 2.5 us outside host drive disconnects the port.
+ */
+component RootPort<DEBOUNCE_US: int = 100000, RESET_US: int = 12000,
+	RECOVERY_US: int = 10000>
+{
+	static assert DEBOUNCE_US > 0 && RESET_US > 0 && RECOVERY_US > 0, "Port durations must be positive microseconds"
+	static assert DEBOUNCE_US <= 1000000 && RESET_US <= 1000000 && RECOVERY_US <= 1000000,
+		"Port durations must not exceed one second"
+	static assert DEBOUNCE_US + RESET_US + RECOVERY_US <= 1000000, "Combined port durations must not exceed one second"
+
+	// Exact time units avoid rounded context.periodNs in TicksFor.
+	const CLOCK_HZ: uint = this.context.TicksPer(1Hz)
+	const MICROSECOND_TICKS: uint = this.context.TicksPer(1MHz)
+	const DEBOUNCE_TICKS: uint = MICROSECOND_TICKS * (DEBOUNCE_US as uint)
+	const RESET_TICKS: uint = MICROSECOND_TICKS * (RESET_US as uint)
+	const RECOVERY_TICKS: uint = MICROSECOND_TICKS * (RECOVERY_US as uint)
+	const FRAME_TICKS: uint = this.context.TicksPer(1000Hz)
+	const DISCONNECT_TICKS: uint = (MICROSECOND_TICKS * 5 + 1) / 2
+	const COUNT_BITS: int = Bits.RequiredFor(DEBOUNCE_TICKS + RESET_TICKS + RECOVERY_TICKS - 1)
+	const FRAME_BITS: int = Bits.RequiredFor(FRAME_TICKS - 1)
+	const DISCONNECT_BITS: int = Bits.RequiredFor(DISCONNECT_TICKS)
+
+	// Clock counts and physical observations; reset is a toggle mailbox.
+	public line: in logic[2]
+	public driving: in bool
+	public resetRequest: in bool
+	public speed: out UsbSpeed
+	public busReset: out bool
+	public connected: out bool
+	public frame: out logic[16]
+	public frameTick: out bool
+	public frameRemaining: out uint
+	phase: logic[3]
+	count: logic[COUNT_BITS]
+	se0: logic[DISCONNECT_BITS]
+	candidate: logic[2]
+	selected: UsbSpeed
+	resetSeen: bool
+	frameCount: logic[16]
+	frameCycle: logic[FRAME_BITS]
+
+	/**
+	 * Checks the exact whole-microsecond timing scale in the inherited context.
+	 */
+	new()
+	{
+		assert CLOCK_HZ % 1000000 == 0, "Root-port timing requires an integer-MHz context"
+	}
+
+	/**
+	 * Publishes link status; connected means reset recovery has finished.
+	 */
+	process Ports[]()
+	{
+		speed = selected
+		busReset = phase == 2
+		connected = phase == 4
+		frame = frameCount
+		frameRemaining = FRAME_TICKS - (frameCycle as uint)
+		frameTick = phase >= 3 && (frameCycle as uint) == FRAME_TICKS - 1
+	}
+
+	/**
+	 * Owns attach/reset/disconnect state independently of scheduled clients.
+	 */
+	process Observe()
+	{
+		state {
+			if (phase >= 3) {
+				if ((frameCycle as uint) == FRAME_TICKS - 1) {
+					frameCycle = 0
+					frameCount++
+				} else {
+					frameCycle++
+				}
+			} else {
+				frameCycle = 0
+				frameCount = 0
+			}
+
+			if (phase >= 3 && !driving && line == 0) {
+				if ((se0 as uint) < DISCONNECT_TICKS) { se0++ }
+			} else {
+				se0 = 0
+			}
+
+			if (CLOCK_HZ % 1000000 != 0 || resetRequest != resetSeen || (se0 as uint) == DISCONNECT_TICKS) {
+				resetSeen = resetRequest
+				phase = 0
+				count = 0
+				selected = UsbSpeed.Unknown
+			} else {
+				match phase
+				{
+					0 =>
+					{
+						if (line == 1 || line == 2) {
+							candidate = line
+							count = 0
+							phase = 1
+						}
+					}
+					1 =>
+					{
+						if (line != candidate) {
+							phase = 0
+						} elif ((count as uint) == ((DEBOUNCE_TICKS - 1) as uint)) {
+							selected = UsbSpeed.Full
+
+							if (candidate == 1) { selected = UsbSpeed.Low }
+
+							phase = 2
+							count = 0
+						} else { count++ }
+					}
+					2 =>
+					{
+						if ((count as uint) == ((RESET_TICKS - 1) as uint)) {
+							phase = 3
+							count = 0
+						} else { count++ }
+					}
+					3 =>
+					{
+						if ((count as uint) == ((RECOVERY_TICKS - 1) as uint)) { phase = 4 } else { count++ }
+					}
+					_ => {}
+				}
+			}
+		}
+	}
+}

@@ -1,0 +1,91 @@
+namespace Livt.Usb.Descriptors
+
+using Livt.Usb
+
+/**
+ * Bounded standard device descriptor validation. Feed an ordered prefix after Reset;
+ * the first eight bytes establish EP0 geometry, all eighteen establish identity.
+ */
+component DeviceDescriptorParser
+{
+	// Initialized prefix and fixed standard descriptor bytes.
+	data: byte[18]
+	count: byte
+	invalid: bool
+
+	// Read-only observation; valid after IsValid succeeds.
+	public identity: out logic[32]
+
+	/**
+	 * Exposes the retained descriptor identity without a scheduled return buffer.
+	 */
+	process Identity[]()
+	{
+		identity = ((data[8] as logic[32]) << 16) | ((data[9] as logic[32]) << 24)
+			| (data[10] as logic[32]) | ((data[11] as logic[32]) << 8)
+	}
+
+	/**
+	 * Discards old identity without exposing uninitialized array bytes.
+	 */
+	public fn Reset()
+	{
+		count = 0;
+		invalid = false
+	}
+
+	/**
+	 * Accepts up to eighteen ordered bytes; additional data invalidates the descriptor.
+	 */
+	public fn Feed(value: byte)
+	{
+		if (count == 18) { invalid = true } else {
+			data[count as int] = value;
+			count++
+		}
+	}
+
+	/**
+	 * Validates descriptor header and the packet sizes allowed for the observed speed.
+	 */
+	public fn HasPacketSize(speed: UsbSpeed) bool
+	{
+		if (invalid || count < 8 || data[0] != 18 || data[1] != 1) { return false }
+
+		if (speed == UsbSpeed.Low) { return data[7] == 8 }
+
+		return speed == UsbSpeed.Full && (data[7] == 8 || data[7] == 16 || data[7] == 32 || data[7] == 64)
+	}
+
+	/**
+	 * Requires a full descriptor, a non-hub device and at least one configuration.
+	 */
+	public fn IsValid(speed: UsbSpeed) bool
+	{
+		return count == 18 && HasPacketSize(speed) && data[4] != 9 && data[17] != 0
+	}
+
+	/**
+	 * Returns bMaxPacketSize0 after HasPacketSize succeeds.
+	 */
+	public fn GetPacketSize() int
+	{
+		return data[7] as int
+	}
+
+	/**
+	 * Returns the vendor identifier after full validation.
+	 */
+	public fn GetVendor() int
+	{
+		return (data[8] as int) | ((data[9] as int) << 8)
+	}
+
+	/**
+	 * Returns the product identifier after full validation.
+	 */
+	public fn GetProduct() int
+	{
+		return (data[10] as int) | ((data[11] as int) << 8)
+	}
+}

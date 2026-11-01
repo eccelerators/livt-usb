@@ -1,0 +1,108 @@
+namespace Livt.Usb
+
+/**
+ * Scheduled single-owner USB host transfers in one inherited clock/reset context.
+ * Stage setup/output bytes while Idle, submit, poll, inspect and release completion.
+ * Calls may take multiple cycles; acceptance does not imply wire completion.
+ * Buffers are controller-owned; callers never lend a mutable external payload.
+ * See docs/host-controller.md for endpoint, timeout and cancellation rules.
+ */
+interface IHostController
+{
+	/**
+	 * Reports supported speed/type combinations, independent of attachment state.
+	 */
+	fn Supports(speed: UsbSpeed, kind: TransferKind) bool
+
+	/**
+	 * Returns the bounded simultaneous attached-device capacity, excluding the root port.
+	 */
+	fn GetDeviceCapacity() int
+
+	/**
+	 * Returns the number of interface entries supported for the attached device.
+	 */
+	fn GetInterfaceCapacity() int
+
+	/**
+	 * Returns endpoint table capacity; control endpoint zero counts as one entry.
+	 */
+	fn GetEndpointCapacity() int
+
+	/**
+	 * Returns maximum data-stage bytes per request, excluding eight setup bytes.
+	 */
+	fn GetTransferCapacity() int
+
+	/**
+	 * Reports attachment; this is a snapshot, not an enumeration or submission guarantee.
+	 */
+	fn IsConnected() bool
+
+	/**
+	 * Returns established speed or Unknown while disconnected.
+	 */
+	fn GetSpeed() UsbSpeed
+
+	/**
+	 * Appends one of exactly eight control setup bytes while Idle; false changes nothing.
+	 */
+	fn TryStageSetup(value: byte) bool
+
+	/**
+	 * Appends an output data byte while Idle; false changes nothing when full/unavailable.
+	 */
+	fn TryStageOutput(value: byte) bool
+
+	/**
+	 * Clears staged setup/output only while Idle; returns false otherwise.
+	 */
+	fn TryClearStaging() bool
+
+	/**
+	 * Snapshots address 0..127 and endpoint 0..15 plus direction as endpoint identity.
+	 * length is data bytes; timeoutFrames is a 1..65535 millisecond deadline including
+	 * scheduling and retries. intervalFrames is 1..255 for interrupt, zero otherwise.
+	 * Control uses endpoint zero, eight setup bytes and setup wLength equal to length.
+	 * Output must be fully staged; input must have no staged output. Non-Accepted
+	 * leaves slot and buffers unchanged. Completion storage must be released first.
+	 */
+	fn TrySubmit(address: int, endpoint: int, kind: TransferKind,
+		direction: TransferDirection, maxPacketSize: int, length: int,
+		timeoutFrames: int, intervalFrames: int) SubmissionResult
+
+	/**
+	 * Reports Idle, Active or retained Complete state without consuming it.
+	 */
+	fn GetState() TransferState
+
+	/**
+	 * Returns the retained terminal result, otherwise Pending.
+	 */
+	fn GetResult() TransferResult
+
+	/**
+	 * Returns completed data bytes excluding setup/status, or zero before completion.
+	 * Successful input may be shorter than requested, including zero. Error results
+	 * may retain an acknowledged prefix; they are not successful application data.
+	 */
+	fn GetActualLength() int
+
+	/**
+	 * Reads completed input bytes within actual length. Returns false with value zero
+	 * for output transfers, incomplete requests or invalid indices. Finish before release.
+	 */
+	fn TryReadInput(index: int, value: out byte) bool
+
+	/**
+	 * Cancels Active work and returns true once completion is Cancelled and no engine
+	 * owns its buffers. False leaves Idle/already-completed work unchanged. Cancellation
+	 * is not rollback of OUT bytes already acknowledged on the bus.
+	 */
+	fn Cancel() bool
+
+	/**
+	 * Releases Complete state and all staged data; false leaves other states unchanged.
+	 */
+	fn TryRelease() bool
+}

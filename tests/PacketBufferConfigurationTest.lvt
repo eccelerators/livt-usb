@@ -1,0 +1,88 @@
+namespace Livt.Usb.Tests
+
+using Livt.IO
+using Livt.Usb.Packets
+
+/**
+ * Exercises memory-style selection, non-power-of-two capacity and backend bounds.
+ */
+@Test
+component PacketBufferConfigurationTest
+{
+	// Explicit compile-time alternatives to the default buffer configuration.
+	automatic: PacketBuffer<1, MemoryStyle.Auto>
+	distributed: PacketBuffer<3, MemoryStyle.Distributed>
+	undersized: PacketBuffer<3, MemoryStyle.Block, ArrayRam<byte, 2>>
+
+	/**
+	 * Creates each backend independently; the undersized provider tests defensive failure.
+	 */
+	new()
+	{
+		automatic = new PacketBuffer<1, MemoryStyle.Auto>()
+		distributed = new PacketBuffer<3, MemoryStyle.Distributed>()
+		undersized = new PacketBuffer<3, MemoryStyle.Block, ArrayRam<byte, 2>>()
+	}
+
+	/**
+	 * A one-byte automatic backend rejects overflow and preserves its sole byte.
+	 */
+	@Test
+	fn SupportsSingleByteAutomaticStorage()
+	{
+		automatic.Clear()
+		assert automatic.TryAppend(0xA5)
+		assert !automatic.TryAppend(0xFF)
+		assert automatic.TryPublish()
+		var value: byte
+		assert automatic.TryRead(0, value)
+		assert value == 0xA5
+		assert !automatic.TryRead(1, value)
+		assert value == 0
+	}
+
+	/**
+	 * A three-byte distributed backend fills exactly its declared capacity.
+	 */
+	@Test
+	fn SupportsNonPowerOfTwoDistributedStorage()
+	{
+		distributed.Clear()
+
+		for (var i = 0; i < 3; i++) {
+			assert distributed.TryAppend((i + 128) as byte)
+		}
+
+		assert !distributed.TryAppend(0xFF)
+		assert distributed.GetLength() == 3
+		assert distributed.TryPublish()
+		var value: byte
+
+		for (var i = 0; i < 3; i++) {
+			assert distributed.TryRead(i, value)
+			assert value == ((i + 128) as byte)
+		}
+
+		assert !distributed.TryRead(3, value)
+		assert value == 0
+	}
+
+	/**
+	 * A missing backend address never advances the initialized prefix or exposes data.
+	 */
+	@Test
+	fn RejectsMissingBackendCapacityWithoutPublishingUnwrittenBytes()
+	{
+		undersized.Clear()
+		assert undersized.TryAppend(0xA5)
+		assert undersized.TryAppend(0x5A)
+		assert !undersized.TryAppend(0xFF)
+		assert undersized.GetLength() == 2
+		assert undersized.TryPublish()
+		var value: byte
+		assert undersized.TryRead(1, value)
+		assert value == 0x5A
+		assert !undersized.TryRead(2, value)
+		assert value == 0
+	}
+}

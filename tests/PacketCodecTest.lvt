@@ -1,0 +1,63 @@
+namespace Livt.Usb.Tests
+
+using Livt.Usb.Packets
+using Livt.Utils.Hashing
+
+/**
+ * Checks packet constants and token layout against independently fixed vectors.
+ */
+@Test
+component PacketCodecTest
+{
+	// Owned compile-time USB token CRC profile.
+	crc: Crc<5, 0x05, true>
+
+	/**
+	 * Creates a combinational checksum helper with no packet policy.
+	 */
+	new()
+	{
+		crc = new Crc<5, 0x05, true>()
+	}
+
+	/**
+	 * All sixteen correctly complemented PID bytes pass redundancy checking;
+	 * supported protocol kinds are a separate restriction.
+	 */
+	@Test
+	fn ChecksPidRedundancy()
+	{
+		for (var nibble = 0; nibble < 16; nibble++) {
+			var encoded = (nibble | ((15 - nibble) << 4)) as byte
+			assert PacketPid.IsValid(encoded)
+			assert !PacketPid.IsValid((encoded ^ 0x10) as byte)
+		}
+
+		assert PacketPid.IsToken(PacketPid.SOF)
+		assert PacketPid.IsData(PacketPid.DATA1)
+		assert PacketPid.IsHandshake(PacketPid.ACK)
+		assert !PacketPid.IsToken(0x78)
+		assert !PacketPid.IsData(0x87)
+		assert !PacketPid.IsHandshake(0x96)
+	}
+
+	/**
+	 * Address zero/endpoint zero serializes as 00 10 after PID. All field values
+	 * round-trip without sign extension or overlap with CRC bits.
+	 */
+	@Test
+	fn PacksTokenFields()
+	{
+		var check = crc.UpdateBits(0x1F, 0, 11) ^ 0x1F
+		assert check == 2
+		assert TokenCodec.Pack(0, check) == 0x1000
+
+		for (var address = 0; address < 128; address++) {
+			for (var endpoint = 0; endpoint < 16; endpoint++) {
+				var fields = TokenCodec.Fields(address as logic[7], endpoint as logic[4])
+				assert (TokenCodec.Address(fields) as uint) == (address as uint)
+				assert (TokenCodec.Endpoint(fields) as uint) == (endpoint as uint)
+			}
+		}
+	}
+}

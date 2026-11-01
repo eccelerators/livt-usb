@@ -1,0 +1,82 @@
+namespace Livt.Usb.Tests
+
+using Livt.Usb
+using Livt.Usb.IO
+
+/**
+ * Verifies PHY capabilities, speed admission and reset ownership through public signals.
+ */
+@Test
+@Context(ClockFrequency = 96MHz)
+component Usb2PhyTest
+{
+	// Owned PHY and controlled idle pair.
+	phy: Usb2Phy
+	dp: logic = 0b1
+	dm: logic = 0b0
+
+	/**
+	 * Binds a full-speed idle input without a simulated host controller.
+	 */
+	new()
+	{
+		phy = new Usb2Phy(dp, dm)
+	}
+
+	/**
+	 * Unsupported speed releases pads; bus reset takes ownership without accepting bytes.
+	 */
+	@Test
+	fn EnforcesSpeedAndResetOwnership()
+	{
+		phy.speed = UsbSpeed.Unknown
+		phy.busReset = false
+		phy.txValid = false
+		phy.txData = 0
+		phy.keepAliveRequest = false
+		Simulation.Wait(10)
+		assert phy.supportsLowSpeed && phy.supportsFullSpeed
+		assert !phy.txReady && !phy.txBusy && phy.dpEnable == 0b0 && phy.dmEnable == 0b0
+		phy.speed = UsbSpeed.Full
+		Simulation.Wait(200)
+		assert phy.txReady && !phy.keepAliveReady
+		assert phy.lineState == 0b10
+		phy.busReset = true
+		Simulation.Wait(10)
+		assert !phy.txReady && !phy.txBusy && !phy.rxActive
+		assert phy.dpEnable == 0b1 && phy.dmEnable == 0b1
+		assert phy.dpOutput == 0b0 && phy.dmOutput == 0b0
+		phy.busReset = false
+		phy.speed = UsbSpeed.High
+		Simulation.Wait(10)
+		assert !phy.txReady && !phy.keepAliveReady
+		assert phy.dpEnable == 0b0 && phy.dmEnable == 0b0
+	}
+
+	/**
+	 * A low-speed device followed by full speed must not retain low-speed local
+	 * timing/polarity defaults across a port cancellation.
+	 */
+	@Test
+	fn ReconnectsAtAnotherSpeed()
+	{
+		phy.speed = UsbSpeed.Unknown
+		phy.busReset = false
+		phy.txValid = false
+		phy.keepAliveRequest = false
+		dp = 0b0;
+		dm = 0b1
+		Simulation.Wait(20)
+		phy.speed = UsbSpeed.Low
+		Simulation.Wait(300)
+		assert phy.txReady && phy.keepAliveReady
+		phy.speed = UsbSpeed.Unknown
+		dp = 0b1;
+		dm = 0b0
+		Simulation.Wait(20)
+		phy.speed = UsbSpeed.Full
+		Simulation.Wait(50)
+		assert phy.txReady && !phy.keepAliveReady
+		assert phy.lineState == 0b10
+	}
+}

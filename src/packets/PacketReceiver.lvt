@@ -1,0 +1,224 @@
+namespace Livt.Usb.Packets
+
+using Livt.IO
+using Livt.Usb
+using Livt.Utils.Hashing
+
+/**
+ * Unstalled PHY packet parser with one retained, validated packet slot.
+ * CAPACITY counts payload bytes. B must implement the exact one-edge synchronous
+ * RAM contract and geometry. Default storage requests block RAM; callers may
+ * select another memory style or substitute a compatible signal-level backend.
+ * completed/accepted are one-edge events. Only available authorizes payload reads.
+ * A packet arriving while occupied is discarded without changing the held packet.
+ */
+component PacketReceiver<CAPACITY: int = 64, STYLE: MemoryStyle = MemoryStyle.Block,
+	B: ISynchronousRam<byte, uint, RamGeometry<CAPACITY>> & new() = SynchronousRam<byte, uint, CAPACITY, STYLE>>
+{
+	static assert CAPACITY > 0 && CAPACITY <= 1023, "Packet capacity must be 1 through 1023"
+
+	// Owned storage/checksum logic and primitive PHY bindings.
+	storage: B
+	crc5: Crc<5, 0x05, true>
+	crc16: Crc<16, 0x8005, true>
+	public speed: in UsbSpeed
+	public cancel: in bool
+	public active: in bool
+	public valid: in bool
+	public data: in byte
+	public physicalError: in bool
+
+	// Unpublished packet state; two trailing bytes never enter payload storage.
+	wasActive: bool
+	blocked: bool
+	byteCount: logic[11]
+	receivePid: byte
+	oldest: byte
+	newest: byte
+	tokenWord: logic[16]
+	checksum: logic[16] = PacketIntegrity.DATA_INITIAL
+	failure: PacketError
+	sampledSpeed: UsbSpeed
+
+	// Coherent publication registers; the output process exposes all on the same edge.
+	published: bool
+	publishedPid: byte
+	publishedLength: uint
+	publishedToken: logic[11]
+	completionPulse: bool
+	acceptPulse: bool
+	completionError: PacketError
+
+	// Consumer-owned release/read controls; reads respond after one accepting edge.
+	public release: in bool
+	public readRequest: in bool
+	public readAddress: in uint
+	public readReady: out bool
+	public readValid: out bool
+	public readData: out byte
+
+	// Published metadata is retained until release/cancel; errors describe completion.
+	public available: out bool
+	public pid: out byte
+	public length: out uint
+	public token: out logic[11]
+	public completed: out bool
+	public accepted: out bool
+	public error: out PacketError
+
+	/**
+	 * All bindings share the PHY clock. cancel must accompany PHY cancellation,
+	 * including reset/disconnect or a speed change. Release wins over a new start.
+	 */
+	new()
+	{
+		storage = new B()
+		crc5 = new Crc<5, 0x05, true>()
+		crc16 = new Crc<16, 0x8005, true>()
+	}
+
+	/**
+	 * Captures payload at the receiving edge; published reads cannot collide with RX.
+	 */
+	process Memory[]()
+	{
+		available = published
+		pid = publishedPid
+		length = publishedLength
+		token = publishedToken
+		completed = completionPulse
+		accepted = acceptPulse
+		error = completionError
+
+		var enabled = !cancel && this.context.rst == 0b0
+		readReady = enabled && published && !release && readAddress < publishedLength
+		readData = 0
+
+		if (readValid && published && enabled) {
+			readData = storage.readData
+		}
+
+		storage.enable = readRequest && readReady
+		storage.writeEnable = false
+		storage.address = readAddress
+		storage.writeData = oldest
+
+		if (enabled && active && wasActive && valid && !blocked
+			&& !published && failure == PacketError.None && PacketPid.IsData(receivePid)
+			&& (byteCount as uint) >= PacketIntegrity.DATA_OVERHEAD && (byteCount as uint) < (CAPACITY as uint) + PacketIntegrity.DATA_OVERHEAD) {
+			storage.enable = true
+			storage.writeEnable = true
+			storage.address = (byteCount as uint) - PacketIntegrity.DATA_OVERHEAD
+		}
+	}
+
+	/**
+	 * Validates an entire packet before publication; no automatic ACK policy.
+	 */
+	process Receive()
+	{
+		state {
+			completionPulse = false
+			acceptPulse = false
+			readValid = readRequest && readReady
+
+			if (release) {
+				published = false
+				publishedLength = 0
+			}
+
+			if (cancel) {
+				wasActive = false
+				published = false
+				readValid = false
+				publishedLength = 0
+				publishedPid = 0
+				publishedToken = 0
+				completionError = PacketError.None
+				failure = PacketError.None
+			} else {
+				if (active && !wasActive) {
+					blocked = published
+					byteCount = 0
+					receivePid = 0
+					checksum = PacketIntegrity.DATA_INITIAL
+					tokenWord = 0
+					failure = PacketError.None
+					sampledSpeed = speed
+
+					if (published) {
+						failure = PacketError.Occupied
+					}
+				}
+
+				if (active && valid) {
+					if (byteCount == 0) {
+						receivePid = data
+
+						if (failure == PacketError.None) {
+							if (!PacketPid.IsValid(data)) {
+								failure = PacketError.InvalidPid
+							} elif (!(PacketPid.IsToken(data) || PacketPid.IsData(data)
+								|| PacketPid.IsHandshake(data)) || (speed != UsbSpeed.Low && speed != UsbSpeed.Full)
+								|| (speed == UsbSpeed.Low && data == PacketPid.SOF)) {
+								failure = PacketError.Unsupported
+							}
+						}
+					} else {
+						checksum = crc16.UpdateByte(checksum, data)
+						oldest = newest
+						newest = data
+
+						if (byteCount == 1) {
+							tokenWord = data as logic[16]
+						} elif (byteCount == 2) {
+							tokenWord = tokenWord | ((data as logic[16]) << 8)
+						}
+					}
+
+					if ((byteCount as uint) < (CAPACITY as uint) + PacketIntegrity.DATA_OVERHEAD + 1) {
+						byteCount++
+					}
+
+					if ((byteCount as uint) > (CAPACITY as uint) + PacketIntegrity.DATA_OVERHEAD && failure == PacketError.None) {
+						failure = PacketError.Overflow
+					}
+				}
+
+				if ((active || wasActive) && (physicalError || speed != sampledSpeed)) {
+					failure = PacketError.Physical
+				}
+
+				if (wasActive && !active) {
+					var result = failure
+					var fields = (tokenWord & 0x07FF) as logic[11]
+					var expected = crc5.UpdateBits(PacketIntegrity.TOKEN_INITIAL, fields as uint, PacketIntegrity.TOKEN_BITS)
+						^ PacketIntegrity.TOKEN_FINAL_XOR
+
+					if (result == PacketError.None) {
+						result = PacketIntegrity.Validate(receivePid, byteCount as uint, speed,
+							checksum, tokenWord, expected)
+					}
+
+					completionPulse = true
+					completionError = result
+
+					if (result == PacketError.None && !blocked) {
+						published = true
+						acceptPulse = true
+						publishedPid = receivePid
+						publishedLength = 0
+
+						if (PacketPid.IsData(receivePid)) {
+							publishedLength = (byteCount as uint) - PacketIntegrity.DATA_OVERHEAD
+						}
+
+						publishedToken = fields
+					}
+				}
+
+				wasActive = active
+			}
+		}
+	}
+}

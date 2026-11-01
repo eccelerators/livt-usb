@@ -1,0 +1,141 @@
+namespace Livt.Usb.Host
+
+using Livt.IO
+using Livt.Usb
+using Livt.Usb.Packets
+
+/**
+ * Owns eight setup registers and configurable payload storage for one transfer.
+ * The controller serializes access and freezes staging while a request is owned.
+ * Only initialized bytes are exposed; Clear discards metadata without RAM erasure.
+ */
+component TransferStorage<STAGING_BYTES: int = 512, STYLE: MemoryStyle = MemoryStyle.Block,
+	B: IRam<byte> & new() = Ram<byte, STAGING_BYTES, STYLE>>
+{
+	static assert STAGING_BYTES >= 8 && STAGING_BYTES <= 65535, "Transfer capacity must be 8..65535 bytes"
+
+	// Fixed setup metadata and its initialized prefix.
+	setup: byte[8]
+	setupLength: int
+
+	// Owned payload backend; no USB packet-timing guarantee from scheduled access.
+	payload: PacketBuffer<STAGING_BYTES, STYLE, B>
+
+	/**
+	 * Creates empty setup and data storage in the inherited context.
+	 */
+	new()
+	{
+		payload = new PacketBuffer<STAGING_BYTES, STYLE, B>()
+	}
+
+	/**
+	 * Appends a setup byte, returning false without change when all eight are present.
+	 */
+	public fn TryAppendSetup(value: byte) bool
+	{
+		if (setupLength == 8) {
+			return false
+		}
+
+		setup[setupLength] = value
+		setupLength++
+		return true
+	}
+
+	/**
+	 * Checks exact setup/data staging and the control direction/wLength fields.
+	 */
+	public fn IsValid(kind: TransferKind, direction: TransferDirection, length: int) bool
+	{
+		if (kind == TransferKind.Control) {
+			if (setupLength != 8) {
+				return false
+			}
+
+			var setupBytes = (setup[6] as int) + (setup[7] as int) * 256
+
+			if (setupBytes != length) {
+				return false
+			}
+
+			if (length > 0) {
+				var input = (setup[0] as uint) >= 128
+
+				if (input != (direction == TransferDirection.DeviceToHost)) {
+					return false
+				}
+			} else {
+				if (direction != TransferDirection.HostToDevice) {
+					return false
+				}
+			}
+		} else {
+			if (setupLength != 0) {
+				return false
+			}
+		}
+
+		if (direction == TransferDirection.HostToDevice) {
+			return payload.GetLength() == length
+		}
+
+		return payload.GetLength() == 0
+	}
+
+	/**
+	 * Appends initialized payload bytes; controller ownership determines their direction.
+	 */
+	public fn TryAppendPayload(value: byte) bool
+	{
+		return payload.TryAppend(value)
+	}
+
+	/**
+	 * Returns the initialized payload length, excluding setup.
+	 */
+	public fn GetLength() int
+	{
+		return payload.GetLength()
+	}
+
+	/**
+	 * Freezes payload bytes for readers; the owner calls this once per lifecycle.
+	 */
+	public fn Publish()
+	{
+		payload.TryPublish()
+	}
+
+	/**
+	 * Reads a published payload byte, returning false and zero on invalid access.
+	 */
+	public fn TryReadPayload(index: int, value: out byte) bool
+	{
+		return payload.TryRead(index, value)
+	}
+
+	/**
+	 * Reads initialized setup data for the controller; failure returns false and zero.
+	 */
+	public fn TryReadSetup(index: int, value: out byte) bool
+	{
+		value = 0
+
+		if (index < 0 || index >= setupLength) {
+			return false
+		}
+
+		value = setup[index]
+		return true
+	}
+
+	/**
+	 * Discards all initialized prefixes after the controller releases the transfer.
+	 */
+	public fn Clear()
+	{
+		setupLength = 0
+		payload.Clear()
+	}
+}

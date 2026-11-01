@@ -1,0 +1,326 @@
+namespace Livt.Usb.Host
+
+using Livt.IO
+using Livt.Usb
+using Livt.Usb.Packets
+
+/**
+ * Cycle-level transaction and frame arbiter, independent of software-style calls.
+ * clearRequest, loadRequest and request are toggle mailboxes; hold each payload
+ * until the matching Accepted output equals its request. Stage OUT bytes first;
+ * every attempt consumes staging. completed is retained until the next acceptance.
+ * Valid IN data is ACKed here before any scheduled payload access; duplicates are
+ * ACKed but reported separately. One retained RX slot is released on next request.
+ */
+component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
+	B: ISynchronousRam<byte, uint, RamGeometry<64>> & new() = SynchronousRam<byte, uint, 64, STYLE>>
+{
+	// Physical durations use exact context rates to avoid TicksFor clock-period rounding.
+	const CLOCK_HZ: uint = this.context.TicksPer(1Hz)
+	const FULL_BIT_TICKS: uint = this.context.TicksPer(12MHz)
+	const LOW_BIT_TICKS: uint = this.context.TicksPer(1500KHz)
+	const MICROSECOND_TICKS: uint = this.context.TicksPer(1MHz)
+	const FRAME_GUARD_TICKS: uint = MICROSECOND_TICKS * 200
+	const RESPONSE_TICKS: uint = MICROSECOND_TICKS * 128
+	const HANDSHAKE_TICKS: uint = LOW_BIT_TICKS * 32
+	const GAP_TICKS: uint = MICROSECOND_TICKS * 2
+	const RESPONSE_BITS: int = Bits.RequiredFor(RESPONSE_TICKS)
+	const GAP_BITS: int = Bits.RequiredFor(GAP_TICKS)
+
+	// Independent packet stores and cycle-level link context.
+	rx: PacketReceiver<64, STYLE, B>
+	tx: PacketTransmitter<64, STYLE, B>
+	public speed: in UsbSpeed
+	public connected: in bool
+	public cancel: in bool
+	public frameTick: in bool
+	public frame: in logic[16]
+	public frameRemaining: in uint
+	public phyReady: in bool
+	public phyBusy: in bool
+	public rxActive: in bool
+	public rxValid: in bool
+	public rxData: in byte
+	public rxError: in bool
+	public txValid: out bool
+	public txData: out byte
+	public keepAlive: out bool
+	public keepReady: in bool
+
+	// Client payload and command handshakes, held stable through acceptance.
+	public clearRequest: in bool
+	public clearAccepted: out bool
+	clearSeen: bool
+	public loadRequest: in bool
+	public loadAccepted: out bool
+	loadSeen: bool
+	public loadData: in byte
+	public loadReady: out bool
+	public request: in bool
+	public requestAccepted: out bool
+	public phaseCode: out byte
+	acceptedRequest: bool
+	public tokenPid: in byte
+	public token: in logic[11]
+	public dataOne: in bool
+	public maxLength: in uint
+	public ready: out bool
+	public completed: out bool
+	public acknowledged: out bool
+	public result: out TransactionResult
+	public length: out uint
+	public readRequest: in bool
+	public readAddress: in uint
+	public readData: out byte
+	public readValid: out bool
+
+	// Exchange phases and retained command; one owner arbitrates all transmit work.
+	const IDLE: logic[4] = 0
+	const TOKEN: logic[4] = 1
+	const DATA: logic[4] = 2
+	const RESPONSE: logic[4] = 3
+	const ACK: logic[4] = 4
+	const FRAME: logic[4] = 5
+	const KEEP: logic[4] = 6
+	const KEEP_WAIT: logic[4] = 7
+	phase: logic[4]
+	savedPid: byte
+	savedOne: bool
+	savedLimit: uint
+	responseCycles: logic[RESPONSE_BITS]
+	responseStarted: bool
+	startLimit: uint
+	pendingFrame: bool
+	gap: logic[GAP_BITS]
+	done: bool
+	outcome: TransactionResult
+	receivedLength: uint
+
+	/**
+	 * Creates two 64-byte packet slots; the owner supplies a PHY in the same clock context.
+	 */
+	new()
+	{
+		assert CLOCK_HZ % 12000000 == 0, "USB transaction clock must be an exact multiple of 12 MHz"
+		rx = new PacketReceiver<64, STYLE, B>()
+		tx = new PacketTransmitter<64, STYLE, B>()
+	}
+
+	/**
+	 * Connects packets and immediate response requests. A 200 us frame guard
+	 * admits only exchanges that fit before the next 1 ms frame boundary.
+	 */
+	process Ports[]()
+	{
+		rx.speed = speed
+		rx.cancel = cancel || !connected
+		rx.active = rxActive
+		rx.valid = rxValid
+		rx.data = rxData
+		rx.physicalError = rxError
+		rx.release = request != acceptedRequest && ready
+		rx.readRequest = readRequest
+		rx.readAddress = readAddress
+		readData = rx.readData
+		readValid = rx.readValid
+		tx.speed = speed
+		tx.cancel = cancel
+		tx.phyReady = phyReady
+		tx.phyBusy = phyBusy
+		tx.clear = clearRequest != clearSeen && phase == IDLE && !tx.busy
+		tx.loadValid = loadRequest != loadSeen && phase == IDLE
+		tx.loadData = loadData
+		loadReady = tx.loadReady && phase == IDLE
+		startLimit = FULL_BIT_TICKS * 18
+
+		if (speed == UsbSpeed.Low) { startLimit = LOW_BIT_TICKS * 18 }
+
+		ready = connected && !cancel && phase == IDLE && !pendingFrame
+			&& !frameTick && frameRemaining > FRAME_GUARD_TICKS && gap == 0 && tx.ready && !rxActive
+		tx.request = false
+		tx.pid = tokenPid
+		tx.token = token
+		keepAlive = phase == KEEP && !cancel
+
+		if (phase == IDLE && pendingFrame && gap == 0 && tx.ready && !rxActive) {
+			if (speed == UsbSpeed.Full) {
+				tx.request = true
+				tx.pid = PacketPid.SOF
+				tx.token = frame as logic[11]
+			}
+		} elif (request != acceptedRequest && ready) {
+			tx.request = true
+		} elif (phase == TOKEN && tx.completed && savedPid != PacketPid.IN) {
+			tx.request = true
+			tx.pid = PacketPid.DATA0
+
+			if (savedOne) { tx.pid = PacketPid.DATA1 }
+		} elif (phase == RESPONSE && rx.accepted && savedPid == PacketPid.IN
+			&& PacketPid.IsData(rx.pid) && rx.length <= savedLimit) {
+			tx.request = true
+			tx.pid = PacketPid.ACK
+		}
+
+		txValid = tx.txValid
+		txData = tx.txData
+		clearAccepted = clearSeen
+		loadAccepted = loadSeen
+		requestAccepted = acceptedRequest
+		phaseCode = phase as byte
+		completed = done
+		acknowledged = done && outcome == TransactionResult.Success && acceptedRequest == request
+		result = outcome
+		length = receivedLength
+	}
+
+	/**
+	 * Bounds a response including wire payload to 128 us and keeps frame traffic
+	 * alive even while the client drains its retained completion over a slow UART.
+	 */
+	process Exchange()
+	{
+		state {
+			if (cancel) {
+				// Cancellation cannot undo a completed wire ACK. Preserve its commit
+				// observation until the next command, including an ACK completing now.
+				if (phase == ACK && tx.completed && outcome == TransactionResult.Success) {
+					done = true
+				}
+
+				if (phase == RESPONSE && savedPid != PacketPid.IN && rx.completed && rx.accepted && rx.pid == PacketPid.ACK) {
+					outcome = TransactionResult.Success
+					done = true
+				}
+
+				if (!done || acceptedRequest != request) {
+					outcome = TransactionResult.Disconnected
+					receivedLength = 0
+				}
+
+				clearSeen = clearRequest
+				loadSeen = loadRequest
+				acceptedRequest = request
+				phase = IDLE
+				pendingFrame = false
+				done = true
+				gap = 0
+			} else {
+				if (tx.clear) { clearSeen = clearRequest }
+
+				if (tx.loadValid && tx.loadReady) { loadSeen = loadRequest }
+
+				match phase
+				{
+					IDLE =>
+					{
+						if (pendingFrame && gap == 0 && tx.ready && !rxActive) {
+							phase = FRAME
+
+							if (speed == UsbSpeed.Low) { phase = KEEP }
+
+							pendingFrame = false
+						} elif (request != acceptedRequest && ready) {
+							acceptedRequest = request
+							savedPid = tokenPid
+							savedOne = dataOne
+							savedLimit = maxLength
+							done = false
+							outcome = TransactionResult.Pending
+							receivedLength = 0
+							phase = TOKEN
+						}
+					}
+					TOKEN =>
+					{
+						if (tx.completed) {
+							phase = DATA
+
+							if (savedPid == PacketPid.IN) { phase = RESPONSE }
+
+							responseCycles = 0
+							responseStarted = false
+						}
+					}
+					DATA =>
+					{
+						if (tx.completed) {
+							phase = RESPONSE
+							responseCycles = 0
+							responseStarted = false
+						}
+					}
+					RESPONSE =>
+					{
+						responseCycles++
+
+						if (rxActive) { responseStarted = true }
+
+						if (rx.completed) {
+							outcome = TransactionResult.ProtocolError
+
+							if (rx.accepted) {
+								if (rx.pid == PacketPid.NAK) { outcome = TransactionResult.Nak } elif (rx.pid == PacketPid.STALL) { outcome = TransactionResult.Stall } elif (savedPid != PacketPid.IN && rx.pid == PacketPid.ACK) {
+									outcome = TransactionResult.Success
+								} elif (savedPid == PacketPid.IN && PacketPid.IsData(rx.pid) && rx.length <= savedLimit) {
+									outcome = TransactionResult.Success
+
+									if ((rx.pid == PacketPid.DATA1) != savedOne) { outcome = TransactionResult.Duplicate }
+
+									receivedLength = rx.length
+									phase = ACK
+								}
+							}
+
+							if (phase != ACK) {
+								done = true
+								phase = IDLE
+								gap = (GAP_TICKS as int) as logic[GAP_BITS]
+							}
+						} elif ((!responseStarted && (responseCycles as uint) >= startLimit)
+							|| (savedPid == PacketPid.IN && (responseCycles as uint) >= RESPONSE_TICKS)
+							|| (savedPid != PacketPid.IN && (responseCycles as uint) >= HANDSHAKE_TICKS)) {
+							outcome = TransactionResult.Timeout
+							done = true
+							phase = IDLE
+							gap = (GAP_TICKS as int) as logic[GAP_BITS]
+						}
+					}
+					ACK =>
+					{
+						if (tx.completed) {
+							done = true
+							phase = IDLE
+							gap = (GAP_TICKS as int) as logic[GAP_BITS]
+						}
+					}
+					FRAME =>
+					{
+						if (tx.completed) {
+							phase = IDLE;
+							gap = (GAP_TICKS as int) as logic[GAP_BITS]
+						}
+					}
+					KEEP =>
+					{
+						if (keepReady) { phase = KEEP_WAIT }
+					}
+					KEEP_WAIT =>
+					{
+						if (!phyBusy) {
+							phase = IDLE;
+							gap = (GAP_TICKS as int) as logic[GAP_BITS]
+						}
+					}
+					_ =>
+					{
+						phase = IDLE
+					}
+				}
+			}
+
+			if (frameTick && !cancel) { pendingFrame = true }
+
+			if (gap != 0) { gap-- }
+		}
+	}
+}

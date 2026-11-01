@@ -1,0 +1,669 @@
+namespace Livt.Usb.Host
+
+using Livt.IO
+using Livt.Usb
+using Livt.Usb.IO
+using Livt.Usb.Packets
+
+/**
+ * Single-device host with retained transfers and autonomous wire/frame service.
+ * One scheduled client owns staging, submission, reading and release. An independent
+ * worker owns accepted storage until completion. Each endpoint/direction retains its
+ * toggle; reset disconnects, cancels active work and clears all toggles.
+ */
+component HostController<CAPACITY: int = 512, STYLE: MemoryStyle = MemoryStyle.Block,
+	B: IRam<byte> & new() = SequentialRam<byte, CAPACITY, STYLE>,
+	PORT_DEBOUNCE_US: int = 100000, PORT_RESET_US: int = 12000, PORT_RECOVERY_US: int = 10000,
+	P: IRam<logic[16]> & new() = SequentialRam<logic[16], 32, STYLE>> : IHostController
+{
+	static assert CAPACITY >= 8 && CAPACITY <= 65535, "Transfer capacity must be 8..65535"
+
+	// Counts include CAPACITY; packet byte indices never exceed 64.
+	const COUNT_BITS: int = Bits.RequiredFor(CAPACITY)
+
+	// Owned link, transaction engine, validation and independent staging/input RAM.
+	phy: Usb2Phy
+	port: RootPort<PORT_DEBOUNCE_US, PORT_RESET_US, PORT_RECOVERY_US>
+	engine: TransactionEngine
+	profile: HostProfile<CAPACITY>
+	output: B
+	input: B
+	setup: byte[8]
+	setupCount: byte
+	outputCount: logic[COUNT_BITS]
+	public dpOutput: out logic
+	public dmOutput: out logic
+	public dpEnable: out logic
+	public dmEnable: out logic
+	public debug: out logic[16]
+	// Result code bits 0..3, last wire length 4..10, endpoint 11..14, toggle 15.
+	public transferDiagnostics: out logic[16]
+
+	// Client-owned request snapshot and toggle mailboxes.
+	owned: bool
+	request: bool
+	cancelRequest: bool
+	resetRequest: bool
+	address: byte
+	endpoint: byte
+	kind: TransferKind
+	direction: TransferDirection
+	packetSize: byte
+	requestedLength: logic[COUNT_BITS]
+	deadline: logic[16]
+	acceptedFrame: logic[16]
+	interval: byte
+
+	// Worker-owned retained completion, endpoint state and command signals.
+	seen: bool
+	finished: bool
+	result: TransferResult
+	actual: logic[COUNT_BITS]
+	toggles: logic[32]
+	pollValid: logic[32]
+	pollFrames: P
+	command: bool
+	commandPid: byte
+	commandOne: bool
+	clearPacket: bool
+	load: bool
+	loadByte: byte
+	read: bool
+	readIndex: byte
+	wireResult: TransactionResult
+	wireAcknowledged: bool
+	packetLength: byte
+	controlOne: bool
+	startFrame: logic[16]
+	lastFrame: logic[16]
+	toggleIndex: byte
+	clearToggleRequest: bool
+	clearToggleSeen: bool
+	clearToggleMask: logic[32]
+
+	/**
+	 * Owns physical signaling in the inherited clock/reset context.
+	 */
+	new(dp: logic, dm: logic)
+	{
+		phy = new Usb2Phy(dp, dm)
+		port = new RootPort<PORT_DEBOUNCE_US, PORT_RESET_US, PORT_RECOVERY_US>()
+		engine = new TransactionEngine()
+		profile = new HostProfile<CAPACITY>()
+		output = new B()
+		input = new B()
+		pollFrames = new P()
+	}
+
+	/**
+	 * Wires clocked services without borrowing aggregates across component boundaries.
+	 */
+	process Ports[]()
+	{
+		port.line = phy.lineState
+		port.driving = phy.dpEnable == 0b1
+		port.resetRequest = resetRequest
+		phy.speed = port.speed
+		phy.busReset = port.busReset
+		phy.txValid = engine.txValid
+		phy.txData = engine.txData
+		phy.keepAliveRequest = engine.keepAlive
+		engine.speed = port.speed
+		engine.connected = port.connected
+		engine.cancel = port.busReset || port.speed == UsbSpeed.Unknown || cancelRequest
+		engine.frameTick = port.frameTick
+		engine.frame = port.frame
+		engine.frameRemaining = port.frameRemaining
+		engine.phyReady = phy.txReady
+		engine.phyBusy = phy.txBusy
+		engine.keepReady = phy.keepAliveReady
+		engine.rxActive = phy.rxActive
+		engine.rxValid = phy.rxValid
+		engine.rxData = phy.rxData
+		engine.rxError = phy.rxError
+		engine.clearRequest = clearPacket
+		engine.loadRequest = load
+		engine.loadData = loadByte
+		engine.request = command
+		engine.tokenPid = commandPid
+		engine.token = TokenCodec.Fields(address as logic[7], endpoint as logic[4])
+		engine.dataOne = commandOne
+		engine.maxLength = packetSize as uint
+		engine.readRequest = read
+		engine.readAddress = readIndex as uint
+		dpOutput = phy.dpOutput
+		dmOutput = phy.dmOutput
+		dpEnable = phy.dpEnable
+		dmEnable = phy.dmEnable
+		var observations = engine.phaseCode as logic[16]
+
+		if (port.connected) { observations = observations | 16 }
+
+		if (command) { observations = observations | 32 }
+
+		if (engine.requestAccepted) { observations = observations | 64 }
+
+		if (owned) { observations = observations | 128 }
+
+		if (request) { observations = observations | 256 }
+
+		if (seen) { observations = observations | 512 }
+
+		if (finished) { observations = observations | 1024 }
+
+		if (phy.rxActive) { observations = observations | 2048 }
+
+		if (phy.txBusy) { observations = observations | 4096 }
+
+		if (phy.txReady) { observations = observations | 8192 }
+
+		if (engine.completed) { observations = observations | 16384 }
+
+		if (engine.ready) { observations = observations | 32768 }
+
+		debug = observations
+		var responseCode: logic[16]
+
+		match engine.result
+		{
+			TransactionResult.Success =>
+			{
+				responseCode = 1
+			}
+			TransactionResult.Nak =>
+			{
+				responseCode = 2
+			}
+			TransactionResult.Stall =>
+			{
+				responseCode = 3
+			}
+			TransactionResult.Timeout =>
+			{
+				responseCode = 4
+			}
+			TransactionResult.ProtocolError =>
+			{
+				responseCode = 5
+			}
+			TransactionResult.Duplicate =>
+			{
+				responseCode = 6
+			}
+			TransactionResult.Disconnected =>
+			{
+				responseCode = 7
+			}
+			_ =>
+			{
+				responseCode = 0
+			}
+		}
+
+		var packetObservation = responseCode | ((engine.length as logic[16]) << 4) | ((endpoint as logic[16]) << 11)
+
+		if (commandOne) { packetObservation = packetObservation | 32768 }
+
+		transferDiagnostics = packetObservation
+	}
+
+	/**
+	 * Reports control/interrupt support and full-speed bulk; no isochronous traffic.
+	 */
+	override fn Supports(speed: UsbSpeed, kind: TransferKind) bool
+	{
+		return profile.Supports(speed, kind)
+	}
+
+	/**
+	 * Supports one directly attached device, without a hub.
+	 */
+	override fn GetDeviceCapacity() int
+	{
+		return 1
+	}
+
+	/**
+	 * Bounds initial configuration discovery to four interfaces.
+	 */
+	override fn GetInterfaceCapacity() int
+	{
+		return 4
+	}
+
+	/**
+	 * Advertises the initial descriptor binding capacity including endpoint zero.
+	 */
+	override fn GetEndpointCapacity() int
+	{
+		return 4
+	}
+
+	/**
+	 * Returns retained data capacity, excluding the eight setup bytes.
+	 */
+	override fn GetTransferCapacity() int
+	{
+		return CAPACITY
+	}
+
+	/**
+	 * Returns true after attach, reset and recovery have completed.
+	 */
+	override fn IsConnected() bool
+	{
+		return port.connected
+	}
+
+	/**
+	 * Reports negotiated line speed, or Unknown before attachment.
+	 */
+	override fn GetSpeed() UsbSpeed
+	{
+		return port.speed
+	}
+
+	/**
+	 * Appends a setup byte only while the transfer slot is idle.
+	 */
+	override fn TryStageSetup(value: byte) bool
+	{
+		if (owned || setupCount == 8) { return false }
+
+		setup[setupCount as int] = value
+		setupCount++
+		return true
+	}
+
+	/**
+	 * Appends one output byte without lending the worker external storage.
+	 */
+	override fn TryStageOutput(value: byte) bool
+	{
+		if (owned || outputCount == (CAPACITY as logic[COUNT_BITS])) { return false }
+
+		output.Write((outputCount as uint) as int, value)
+		outputCount++
+		return true
+	}
+
+	/**
+	 * Discards only idle staging; active and retained completions are immutable.
+	 */
+	override fn TryClearStaging() bool
+	{
+		if (owned) { return false }
+
+		setupCount = 0
+		outputCount = 0
+		return true
+	}
+
+	/**
+	 * Validates the complete request before publishing its toggle to the worker.
+	 */
+	override fn TrySubmit(address: int, endpoint: int, kind: TransferKind,
+		direction: TransferDirection, maxPacketSize: int, length: int,
+		timeoutFrames: int, intervalFrames: int) SubmissionResult
+	{
+		if (owned) { return SubmissionResult.Busy }
+
+		if (!port.connected) { return SubmissionResult.Disconnected }
+
+		if (!profile.Supports(port.speed, kind)) { return SubmissionResult.Unsupported }
+
+		if (!profile.IsValid(port.speed, address, endpoint, kind, maxPacketSize, length, timeoutFrames, intervalFrames)) {
+			return SubmissionResult.Invalid
+		}
+
+		if (kind == TransferKind.Control) {
+			if (setupCount != 8 || (setup[6] as int) + (setup[7] as int) * 256 != length) { return SubmissionResult.Invalid }
+
+			if (length > 0 && ((setup[0] & 128) != 0) != (direction == TransferDirection.DeviceToHost)) { return SubmissionResult.Invalid }
+
+			if (length == 0 && direction != TransferDirection.HostToDevice) { return SubmissionResult.Invalid }
+		} elif (setupCount != 0) { return SubmissionResult.Invalid }
+
+		if (direction == TransferDirection.HostToDevice) {
+			if ((outputCount as uint) != (length as uint)) { return SubmissionResult.Invalid }
+		} elif (outputCount != 0) { return SubmissionResult.Invalid }
+
+		this.address = address as byte
+		this.endpoint = endpoint as byte
+		this.kind = kind
+		this.direction = direction
+		packetSize = maxPacketSize as byte
+		requestedLength = length as logic[COUNT_BITS]
+		deadline = timeoutFrames as logic[16]
+		acceptedFrame = port.frame
+		interval = intervalFrames as byte
+		cancelRequest = false
+		owned = true
+		request = !request
+		return SubmissionResult.Accepted
+	}
+
+	/**
+	 * Reports retained completion only after the worker releases all storage.
+	 */
+	override fn GetState() TransferState
+	{
+		if (!owned) { return TransferState.Idle }
+
+		if (finished == request) { return TransferState.Complete }
+
+		return TransferState.Active
+	}
+
+	/**
+	 * Returns Pending until completion is published.
+	 */
+	override fn GetResult() TransferResult
+	{
+		if (!owned || finished != request) { return TransferResult.Pending }
+
+		return result
+	}
+
+	/**
+	 * Reports the acknowledged prefix after completion, including error prefixes.
+	 */
+	override fn GetActualLength() int
+	{
+		if (!owned || finished != request) { return 0 }
+
+		return (actual as uint) as int
+	}
+
+	/**
+	 * Reads retained IN data only within its initialized prefix.
+	 */
+	override fn TryReadInput(index: int, value: out byte) bool
+	{
+		value = 0
+
+		if (!owned || finished != request || direction != TransferDirection.DeviceToHost || index < 0 || index >= ((actual as uint) as int)) { return false }
+
+		value = input.Read(index)
+		return true
+	}
+
+	/**
+	 * Cancels active wire work and waits until the worker publishes Cancelled.
+	 */
+	override fn Cancel() bool
+	{
+		if (!owned || finished == request) { return false }
+
+		cancelRequest = true
+
+		while (finished != request) {}
+
+		if (result != TransferResult.Cancelled) {
+			cancelRequest = false
+			return false
+		}
+
+		return true
+	}
+
+	/**
+	 * Releases retained completion and prepares empty staging for a new request.
+	 */
+	override fn TryRelease() bool
+	{
+		if (!owned || finished != request) { return false }
+
+		owned = false
+		cancelRequest = false
+		setupCount = 0
+		outputCount = 0
+		return true
+	}
+
+	/**
+	 * Requests re-enumeration through a full port debounce/reset cycle.
+	 */
+	public fn ResetPort()
+	{
+		resetRequest = !resetRequest
+	}
+
+	/**
+	 * Resets one data toggle after a successful CLEAR_FEATURE(ENDPOINT_HALT).
+	 * The single owner calls only while idle; configuration/reset clears all entries.
+	 */
+	public fn ClearToggle(endpoint: int, inputDirection: bool) bool
+	{
+		if (owned || endpoint < 1 || endpoint > 15) { return false }
+
+		var index = endpoint * 2
+
+		if (inputDirection) { index++ }
+
+		clearToggleMask = (1 as logic[32]) << index
+		clearToggleRequest = !clearToggleRequest
+
+		while (clearToggleSeen != clearToggleRequest) {}
+
+		return true
+	}
+
+	/**
+	 * Evaluates cancellation and a wrapping millisecond deadline between attempts.
+	 */
+	fn CanContinue() bool
+	{
+		if (cancelRequest) {
+			result = TransferResult.Cancelled;
+			return false
+		}
+
+		if (!port.connected) {
+			result = TransferResult.Disconnected;
+			return false
+		}
+
+		if ((((port.frame as uint) - (startFrame as uint)) as logic[16]) >= deadline) {
+			result = TransferResult.Timeout;
+			return false
+		}
+
+		return true
+	}
+
+	/**
+	 * Executes an attempt; OUT retries reload immutable staging. The engine ACKs
+	 * IN before this worker reads the retained packet. Interval is enforced at retries.
+	 */
+	fn Exchange(pid: byte, one: bool, count: byte, offset: logic[COUNT_BITS]) bool
+	{
+		wireAcknowledged = false
+
+		while (CanContinue()) {
+			if (kind == TransferKind.Interrupt && ((pollValid >> (toggleIndex as int)) & 1) != 0) {
+				var polledFrame = pollFrames.Read(toggleIndex as int)
+
+				while ((((port.frame as uint) - (polledFrame as uint)) as logic[16]) < (interval as logic[16]) && CanContinue()) {}
+
+				if (!CanContinue()) { return false }
+			}
+
+			clearPacket = !clearPacket
+
+			while (engine.clearAccepted != clearPacket && CanContinue()) {}
+
+			if (!CanContinue()) { return false }
+
+			if (pid != PacketPid.IN) {
+				for (var index: byte = 0; index < count; index++) {
+					if (pid == PacketPid.SETUP) { loadByte = setup[index as int] } else { loadByte = output.Read(((offset as uint) + (index as uint)) as int) }
+
+					load = !load
+
+					while (engine.loadAccepted != load && CanContinue()) {}
+
+					if (!CanContinue()) { return false }
+				}
+			}
+
+			commandPid = pid
+			commandOne = one
+			command = !command
+
+			while (engine.requestAccepted != command && port.connected && !cancelRequest) {}
+
+			if (kind == TransferKind.Interrupt) {
+				pollFrames.Write(toggleIndex as int, port.frame)
+				pollValid = pollValid | ((1 as logic[32]) << (toggleIndex as int))
+			}
+
+			while (!engine.completed && port.connected && !cancelRequest) {}
+
+			wireAcknowledged = engine.acknowledged
+
+			if (!CanContinue()) { return false }
+
+			wireResult = engine.result
+			packetLength = engine.length as byte
+
+			if (wireResult == TransactionResult.Success) { return true }
+
+			if (wireResult == TransactionResult.Stall) {
+				result = TransferResult.Stall;
+				return false
+			}
+
+			lastFrame = port.frame
+
+			while ((((port.frame as uint) - (lastFrame as uint)) as logic[16]) < (interval as logic[16]) && CanContinue()) {}
+
+			if (interval == 0) {
+				while (port.frame == lastFrame && CanContinue()) {}
+			}
+		}
+
+		return false
+	}
+
+	/**
+	 * Copies the retained packet after the wire ACK; overflow never exposes extra bytes.
+	 */
+	fn CopyPacket() bool
+	{
+		if ((actual as uint) + (packetLength as uint) > (requestedLength as uint)) {
+			result = TransferResult.Overflow;
+			return false
+		}
+
+		for (var index: byte = 0; index < packetLength; index++) {
+			readIndex = index
+			read = true
+
+			while (!engine.readValid && CanContinue()) {}
+
+			if (!CanContinue()) { return false }
+
+			input.Write(((actual as uint) + (index as uint)) as int, engine.readData)
+			read = false
+		}
+
+		actual = ((actual as uint) + (packetLength as uint)) as logic[COUNT_BITS]
+		return true
+	}
+
+	/**
+	 * Serializes control stages or packetized interrupt/bulk data and publishes once.
+	 */
+	process Work()
+	{
+		if (!port.connected) {
+			toggles = 0;
+			pollValid = 0
+		}
+
+		if (clearToggleRequest != clearToggleSeen) {
+			toggles = toggles & ~clearToggleMask
+			clearToggleSeen = clearToggleRequest
+		}
+
+		if (request == seen) { continue }
+
+		seen = request
+		startFrame = acceptedFrame
+		actual = 0
+		result = TransferResult.Pending
+		controlOne = false
+		toggleIndex = ((endpoint as int) * 2) as byte
+
+		if (direction == TransferDirection.DeviceToHost) { toggleIndex++ }
+
+		var success: bool
+		success = true
+
+		if (kind == TransferKind.Control) {
+			success = Exchange(PacketPid.SETUP, false, 8, 0)
+			controlOne = true
+		} else {
+			controlOne = ((toggles >> (toggleIndex as int)) & 1) != 0
+		}
+
+		var more = kind != TransferKind.Control || requestedLength != 0
+
+		while (success && more) {
+			var remaining = (requestedLength as uint) - (actual as uint)
+			var count: byte
+			count = packetSize
+
+			if (remaining < (packetSize as uint)) { count = remaining as byte }
+
+			var pid: byte
+			pid = PacketPid.OUT
+
+			if (direction == TransferDirection.DeviceToHost) { pid = PacketPid.IN }
+
+			success = Exchange(pid, controlOne, count, actual)
+
+			if (wireAcknowledged) {
+				// Retention failure or cancellation cannot roll back an ACKed packet.
+				controlOne = !controlOne
+
+				if (kind != TransferKind.Control) {
+					toggles = toggles ^ ((1 as logic[32]) << (toggleIndex as int))
+				}
+
+				if (direction == TransferDirection.HostToDevice) {
+					actual = ((actual as uint) + (count as uint)) as logic[COUNT_BITS]
+				}
+			}
+
+			if (success && direction == TransferDirection.DeviceToHost) { success = CopyPacket() }
+
+			more = actual < requestedLength
+
+			if (direction == TransferDirection.DeviceToHost && packetLength != packetSize) { more = false }
+		}
+
+		if (success && kind == TransferKind.Control) {
+			if (direction == TransferDirection.DeviceToHost && requestedLength != 0) {
+				success = Exchange(PacketPid.OUT, true, 0, 0)
+			} else {
+				success = Exchange(PacketPid.IN, true, 0, 0)
+
+				if (success && packetLength != 0) {
+					result = TransferResult.ProtocolError;
+					success = false
+				}
+			}
+
+			if (success && setup[0] == 0 && setup[1] == 9) {
+				toggles = 0;
+				pollValid = 0
+			}
+		}
+
+		if (cancelRequest) { result = TransferResult.Cancelled } elif (success) { result = TransferResult.Success }
+
+		finished = seen
+	}
+}

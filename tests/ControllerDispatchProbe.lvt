@@ -1,0 +1,44 @@
+namespace Livt.Usb.Tests
+
+using Livt.Usb
+
+/**
+ * Consumer with both constructor-bound and function-parameter interface dispatch.
+ */
+component ControllerDispatchProbe
+{
+	// Borrowed controller, retained for the probe lifetime.
+	controller: IHostController
+
+	/**
+	 * Binds an interchangeable controller without owning its implementation.
+	 */
+	new(controller: IHostController)
+	{
+		this.controller = controller
+	}
+
+	/**
+	 * Reads through a stored interface; completion must capture the actual return value.
+	 */
+	public fn ReadBoundCapacity() int
+	{
+		return controller.GetTransferCapacity()
+	}
+
+	/**
+	 * Exercises the extra dispatch hops of an interface-typed function parameter.
+	 */
+	public fn ReadParameterCapacity(other: IHostController) int
+	{
+		return other.GetTransferCapacity()
+	}
+
+	/**
+	 * Reads completed input through a constructor-bound interface dependency.
+	 */
+	public fn TryReadInput(index: int, value: out byte) bool
+	{
+		return controller.TryReadInput(index, value)
+	}
+}

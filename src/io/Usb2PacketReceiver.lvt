@@ -1,0 +1,189 @@
+namespace Livt.Usb.IO
+
+using Livt.Usb
+
+/**
+ * Decodes sampled low/full-speed SYNC, NRZI and stuffing into an unstalled stream.
+ * PID/CRC bytes are published without interpretation. Error is retained through
+ * packet completion until the next start or cancellation. Up to six trailing
+ * decoded ones may be EOP dribble; packet integrity remains the link's responsibility.
+ */
+component Usb2PacketReceiver
+{
+	// Framing phases; recovery requires qualified idle before another SYNC.
+	const IDLE: logic[3] = 0
+	const SYNC: logic[3] = 1
+	const DATA: logic[3] = 2
+	const END: logic[3] = 3
+	const RECOVER: logic[3] = 4
+
+	// Borrowed sampler signals in the same clock context; no aggregate copy.
+	speed: UsbSpeed
+	enabled: bool
+	lineState: logic[2]
+	bitTick: bool
+	bitState: logic[2]
+	idle: bool
+	se0: bool
+	longSe0: bool
+	invalid: bool
+
+	// Packet history and byte assembly.
+	sampledSpeed: UsbSpeed = UsbSpeed.Unknown
+	phase: logic[3]
+	armed: bool
+	previous: logic[2]
+	syncIndex: logic[3]
+	bitIndex: logic[3]
+	ones: logic[3]
+	payload: logic[8]
+	seenByte: bool
+
+	// Receiver-owned packet event stream.
+	public active: out bool
+	public valid: out bool
+	public data: out byte
+	public error: out bool
+
+	/**
+	 * Binds sampled signal ports directly. Disabling cancels RX.
+	 * Scalar bindings avoid a compiler-added register on borrowed component outputs.
+	 */
+	new(speed: UsbSpeed, enabled: bool, lineState: logic[2], bitTick: bool,
+		bitState: logic[2], idle: bool, se0: bool, longSe0: bool, invalid: bool)
+	{
+		this.speed = speed
+		this.enabled = enabled
+		this.lineState = lineState
+		this.bitTick = bitTick
+		this.bitState = bitState
+		this.idle = idle
+		this.se0 = se0
+		this.longSe0 = longSe0
+		this.invalid = invalid
+	}
+
+	/**
+	 * Decodes one sampled bit at a time while independently qualifying EOP/error.
+	 */
+	process Decode()
+	{
+		state {
+			valid = false
+			var j: logic[2]
+			j = 0b10
+
+			if (speed == UsbSpeed.Low) {
+				j = 0b01
+			}
+
+			var k = j ^ 0b11
+
+			if (!enabled || speed != sampledSpeed) {
+				sampledSpeed = speed
+				phase = IDLE
+				armed = false
+				active = false
+				error = false
+			} elif (phase == RECOVER) {
+				if (idle) {
+					phase = IDLE
+					armed = true
+				}
+			} elif (phase == END) {
+				if (longSe0 || invalid || lineState == k) {
+					error = true
+					active = false
+					phase = RECOVER
+				} elif (lineState == j) {
+					active = false
+					phase = IDLE
+					armed = false
+				}
+			} elif (phase != IDLE && invalid) {
+				error = true
+				active = false
+				phase = RECOVER
+			} elif (phase != IDLE && se0) {
+				var tailMask = ((1 as uint) << (bitIndex as uint)) - 1
+
+				if (phase != DATA || !seenByte || (bitIndex == 0 && ones == 6)
+					|| (bitIndex != 0 && ((payload as uint) != tailMask || bitIndex > 6))) {
+					error = true
+				}
+
+				phase = END
+			} elif (phase == IDLE) {
+				if (idle) {
+					armed = true
+				}
+
+				if (armed && bitTick && bitState == k && !se0 && !invalid) {
+					active = true
+					error = false
+					phase = SYNC
+					syncIndex = 1
+					previous = k
+					payload = 0
+					bitIndex = 0
+					seenByte = false
+					ones = 0
+					armed = false
+				}
+			} elif (bitTick) {
+				if (phase == SYNC) {
+					var expected = k
+
+					if ((syncIndex & 1) != 0 && syncIndex != 7) {
+						expected = j
+					}
+
+					if (bitState != expected) {
+						error = true
+						active = false
+						phase = RECOVER
+					} elif (syncIndex == 7) {
+						phase = DATA
+						ones = 1
+					} else {
+						syncIndex++
+					}
+				} else {
+					var bit = bitState == previous
+					previous = bitState
+
+					if (ones == 6) {
+						if (bit) {
+							error = true
+							active = false
+							phase = RECOVER
+						} else {
+							ones = 0
+						}
+					} else {
+						var nextPayload = payload
+						nextPayload[bitIndex as uint] = 0b0
+
+						if (bit) {
+							nextPayload[bitIndex as uint] = 0b1
+							ones++
+						} else {
+							ones = 0
+						}
+
+						if (bitIndex == 7) {
+							data = nextPayload as byte
+							valid = true
+							seenByte = true
+							bitIndex = 0
+							payload = 0
+						} else {
+							payload = nextPayload
+							bitIndex++
+						}
+					}
+				}
+			}
+		}
+	}
+}

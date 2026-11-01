@@ -1,0 +1,122 @@
+namespace Livt.Usb.Tests
+
+using Livt.IO
+using Livt.Usb
+using Livt.Usb.Packets
+
+/**
+ * Exercises non-power-of-two distributed storage and cancellation independently
+ * of PHY waveform timing. Full CRC/payload vectors also run through exported RTL.
+ */
+@Test
+component PacketReceiverTest
+{
+	// A deliberately small packet slot catches capacity-boundary mistakes.
+	rx: PacketReceiver<3, MemoryStyle.Distributed>
+
+	/**
+	 * Owns a three-byte receiver; each test initializes its input signals.
+	 */
+	new()
+	{
+		rx = new PacketReceiver<3, MemoryStyle.Distributed>()
+	}
+
+	/**
+	 * Resets publication and establishes a full-speed byte source.
+	 */
+	fn Initialize()
+	{
+		rx.cancel = true
+		rx.active = false
+		rx.valid = false
+		rx.data = 0
+		rx.physicalError = false
+		rx.release = false
+		rx.readRequest = false
+		rx.readAddress = 0
+		rx.speed = UsbSpeed.Full
+		Simulation.Wait(3)
+		rx.cancel = false
+		Simulation.Wait(3)
+	}
+
+	/**
+	 * Emits exactly one byte acceptance edge within the active packet.
+	 */
+	fn Send(value: byte)
+	{
+		state {
+			rx.data = value
+			rx.valid = true
+		}
+
+		state {
+			rx.valid = false
+		}
+	}
+
+	/**
+	 * A full three-byte payload publishes only after CRC, supports bounded reads,
+	 * and disappears on cancellation without relying on clearing payload RAM.
+	 */
+	@Test
+	fn PublishesBoundedPayload()
+	{
+		Initialize()
+		rx.active = true
+		Send(PacketPid.DATA0)
+		Send(1)
+		Send(2)
+		Send(3)
+		Send(0x9E)
+		Send(0x9E)
+		assert !rx.available
+		rx.active = false
+		Simulation.Wait(4)
+		assert rx.available && rx.error == PacketError.None && rx.length == 3
+
+		for (var index = 0; index < 3; index++) {
+			rx.readAddress = index as uint
+			rx.readRequest = true
+			Simulation.Wait(3)
+			assert rx.readValid && rx.readData == ((index + 1) as byte)
+			rx.readRequest = false
+		}
+
+		rx.readAddress = 3
+		rx.readRequest = true
+		Simulation.Wait(3)
+		assert !rx.readReady && !rx.readValid
+		rx.cancel = true
+		Simulation.Wait(3)
+		assert !rx.available && !rx.readValid && !rx.completed
+	}
+
+	/**
+	 * Overflow is never published, and release of a later handshake permits reuse.
+	 */
+	@Test
+	fn RejectsOverflowAndRecovers()
+	{
+		Initialize()
+		rx.active = true
+		Send(PacketPid.DATA1)
+
+		for (var index = 0; index < 6; index++) {
+			Send(0)
+		}
+
+		rx.active = false
+		Simulation.Wait(4)
+		assert !rx.available && rx.error == PacketError.Overflow
+		rx.active = true
+		Send(PacketPid.ACK)
+		rx.active = false
+		Simulation.Wait(4)
+		assert rx.available && rx.pid == PacketPid.ACK && rx.length == 0
+		rx.release = true
+		Simulation.Wait(3)
+		assert !rx.available
+	}
+}

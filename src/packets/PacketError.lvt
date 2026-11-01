@@ -1,0 +1,16 @@
+namespace Livt.Usb.Packets
+
+/**
+ * Packet-local failure; no result implies a completed host transfer.
+ */
+enum PacketError
+{
+	None
+	Physical
+	InvalidPid
+	Unsupported
+	Length
+	Checksum
+	Overflow
+	Occupied
+}

@@ -1,0 +1,50 @@
+namespace Livt.Usb.Packets
+
+/**
+ * USB low/full-speed packet identifiers including their complemented upper nibble.
+ * Only the directly attached control/interrupt/bulk profile is admitted here.
+ */
+component PacketPid
+{
+	public const OUT: byte = 0xE1
+	public const IN: byte = 0x69
+	public const SETUP: byte = 0x2D
+	public const SOF: byte = 0xA5
+	public const DATA0: byte = 0xC3
+	public const DATA1: byte = 0x4B
+	public const ACK: byte = 0xD2
+	public const NAK: byte = 0x5A
+	public const STALL: byte = 0x1E
+
+	/**
+	 * Checks the PID's redundant nibble separately from supported packet kinds.
+	 */
+	public static fn IsValid[](pid: byte) bool
+	{
+		return (((pid as uint) ^ ((pid as uint) >> 4)) & 0x0F) == 0x0F
+	}
+
+	/**
+	 * Tokens and SOF carry eleven information bits plus CRC5.
+	 */
+	public static fn IsToken[](pid: byte) bool
+	{
+		return pid == OUT || pid == IN || pid == SETUP || pid == SOF
+	}
+
+	/**
+	 * DATA0 and DATA1 carry payload followed by CRC16.
+	 */
+	public static fn IsData[](pid: byte) bool
+	{
+		return pid == DATA0 || pid == DATA1
+	}
+
+	/**
+	 * Handshakes end immediately after PID.
+	 */
+	public static fn IsHandshake[](pid: byte) bool
+	{
+		return pid == ACK || pid == NAK || pid == STALL
+	}
+}

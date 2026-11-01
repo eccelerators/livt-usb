@@ -1,0 +1,207 @@
+namespace Livt.Usb.Host
+
+using Livt.Usb
+using Livt.Usb.Descriptors
+
+/**
+ * Bounded direct-device enumeration: address one, first configuration, alternate zero.
+ * One scheduled owner calls Enumerate and then owns the controller for class traffic.
+ * Keeps standard descriptor discovery independent of class-specific initialization.
+ */
+component DeviceEnumerator<LIMIT: int = 512>
+{
+	// Round two milliseconds up to whole ticks, including non-integral-MHz contexts.
+	const ADDRESS_RECOVERY_TICKS: uint = (this.context.TicksPer(1Hz) - 1) / 500 + 1
+	const ADDRESS_RECOVERY_BITS: int = Bits.RequiredFor(ADDRESS_RECOVERY_TICKS)
+
+	// Successful discovery requests are bounded by LIMIT.
+	const COUNT_BITS: int = Bits.RequiredFor(LIMIT)
+
+	// Borrowed controller and owned parsers/request helper.
+	controller: IHostController
+	control: ControlTransfer
+	device: DeviceDescriptorParser
+	configuration: ConfigurationDescriptorParser<LIMIT>
+	packetSize: byte
+	configured: bool
+	phase: byte
+
+	// Read-only discovery observations; configuration is zero until selected.
+	public identity: out logic[32]
+	public packetBytes: out byte
+	public configurationValue: out byte
+
+	/**
+	 * Binds a controller with at least LIMIT input bytes for configuration discovery.
+	 */
+	new(controller: IHostController)
+	{
+		this.controller = controller
+		control = new ControlTransfer(controller)
+		device = new DeviceDescriptorParser()
+		configuration = new ConfigurationDescriptorParser<LIMIT>()
+	}
+
+	/**
+	 * Forwards validated descriptor identity and current EP0 geometry without copies.
+	 */
+	process Observations[]()
+	{
+		identity = 0
+		packetBytes = packetSize
+
+		if (phase >= 4) {
+			identity = device.identity
+		}
+	}
+
+	/**
+	 * Returns the discovery phase for diagnostics; 6 means configured, not class-ready.
+	 */
+	public fn GetPhase() byte
+	{
+		return phase
+	}
+
+	/**
+	 * Reports the current EP0 packet size (initially eight).
+	 */
+	public fn GetPacketSize() int
+	{
+		return packetSize as int
+	}
+
+	/**
+	 * Reports the validated vendor/product identity (vendor in the upper half).
+	 */
+	public fn GetIdentity() logic[32]
+	{
+		return identity
+	}
+
+	/**
+	 * Returns the selected configuration value, or zero before successful setup.
+	 */
+	public fn GetConfiguration() int
+	{
+		if (!configured) {
+			return 0
+		}
+
+		return configurationValue as int
+	}
+
+	/**
+	 * Returns a bounded standard endpoint field only after configuration succeeds.
+	 */
+	public fn GetEndpoint(index: int, field: int) int
+	{
+		if (!configured) { return -1 }
+
+		return configuration.GetEndpoint(index, field)
+	}
+
+	/**
+	 * Reads retained control data into the selected bounded descriptor parser.
+	 */
+	fn Parse(deviceDescriptor: bool)
+	{
+		var count = controller.GetActualLength() as logic[COUNT_BITS]
+
+		for (var index: logic[COUNT_BITS] = 0; index < count; index++) {
+			var value: byte
+
+			if (!controller.TryReadInput((index as uint) as int, value)) { break }
+
+			if (deviceDescriptor) { device.Feed(value) } else { configuration.Feed(value) }
+		}
+
+		controller.TryRelease()
+	}
+
+	/**
+	 * Enumerates one freshly reset device. Every failed request is released; caller
+	 * may wait for unplug or request a new root-port reset before another attempt.
+	 */
+	public fn Enumerate() bool
+	{
+		configured = false;
+		packetSize = 8;
+		configurationValue = 0;
+		phase = 1
+		device.Reset()
+		configuration.Reset()
+
+		if (!control.Run(0, 8, 128, 6, 256, 0, 8)) {
+			controller.TryRelease();
+			return false
+		}
+
+		Parse(true)
+
+		if (!device.HasPacketSize(controller.GetSpeed())) { return false }
+
+		packetSize = device.GetPacketSize() as byte
+		phase = 2
+
+		if (!control.Run(0, packetSize as int, 0, 5, 1, 0, 0)) {
+			controller.TryRelease();
+			return false
+		}
+
+		controller.TryRelease()
+		// USB SET_ADDRESS recovery is at least two milliseconds.
+		for (var cycle: logic[ADDRESS_RECOVERY_BITS] = 0; (cycle as uint) < ADDRESS_RECOVERY_TICKS; cycle++) {
+			state {}
+		}
+
+		phase = 3
+		device.Reset()
+
+		if (!control.Run(1, packetSize as int, 128, 6, 256, 0, 18)) {
+			controller.TryRelease();
+			return false
+		}
+
+		Parse(true)
+
+		if (!device.IsValid(controller.GetSpeed())) { return false }
+
+		phase = 4
+
+		if (!control.Run(1, packetSize as int, 128, 6, 512, 0, 9)) {
+			controller.TryRelease();
+			return false
+		}
+
+		Parse(false)
+		var length = configuration.GetTotalLength()
+
+		if (length < 9 || length > controller.GetTransferCapacity()) { return false }
+
+		configuration.Reset()
+
+		if (!control.Run(1, packetSize as int, 128, 6, 512, 0, length)) {
+			controller.TryRelease();
+			return false
+		}
+
+		Parse(false)
+
+		if (!configuration.IsValid(controller.GetSpeed())) { return false }
+
+		phase = 5
+		var selectedConfiguration = configuration.GetConfiguration() as byte
+
+		if (!control.Run(1, packetSize as int, 0, 9, selectedConfiguration as int, 0, 0)) {
+			controller.TryRelease();
+			return false
+		}
+
+		controller.TryRelease()
+		configurationValue = selectedConfiguration
+		configured = true;
+		phase = 6
+		return true
+	}
+}

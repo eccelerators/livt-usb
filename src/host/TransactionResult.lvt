@@ -1,0 +1,16 @@
+namespace Livt.Usb.Host
+
+/**
+ * Result of one token/data/handshake exchange retained until the next command.
+ */
+enum TransactionResult
+{
+	Pending
+	Success
+	Nak
+	Stall
+	Timeout
+	ProtocolError
+	Duplicate
+	Disconnected
+}
