@@ -1,0 +1,29 @@
+namespace Livt.Usb.Tests
+
+/**
+ * Checks the default registered link boundary with the real packet engine.
+ */
+@Test
+@Context(ClockFrequency = 96MHz)
+component TransactionPipelineTest
+{
+	// Owned probe for this pipeline configuration.
+	probe: TransactionPipelineProbe<true>
+
+	/**
+	 * Creates the configured protocol probe.
+	 */
+	new()
+	{
+		probe = new TransactionPipelineProbe<true>()
+	}
+
+	/**
+	 * Verifies packet contents, ACK deadline, duplicate, CRC and cancel behavior.
+	 */
+	@Test
+	fn PreservesTransactions()
+	{
+		probe.Run()
+	}
+}

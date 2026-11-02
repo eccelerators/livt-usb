@@ -118,6 +118,11 @@ component PacketReceiver<CAPACITY: int = 64, STYLE: MemoryStyle = MemoryStyle.Bl
 	process Receive()
 	{
 		state {
+			// EOP cannot accept a byte; use the state before active-byte updates.
+			var packetCount = byteCount
+			var packetPid = receivePid
+			var packetToken = tokenWord
+			var packetChecksum = checksum
 			completionPulse = false
 			acceptPulse = false
 			readValid = readRequest && readReady
@@ -191,13 +196,13 @@ component PacketReceiver<CAPACITY: int = 64, STYLE: MemoryStyle = MemoryStyle.Bl
 
 				if (wasActive && !active) {
 					var result = failure
-					var fields = (tokenWord & 0x07FF) as logic[11]
+					var fields = (packetToken & 0x07FF) as logic[11]
 					var expected = crc5.UpdateBits(PacketIntegrity.TOKEN_INITIAL, fields as uint, PacketIntegrity.TOKEN_BITS)
 						^ PacketIntegrity.TOKEN_FINAL_XOR
 
 					if (result == PacketError.None) {
-						result = PacketIntegrity.Validate(receivePid, byteCount as uint, speed,
-							checksum, tokenWord, expected)
+						result = PacketIntegrity.Validate(packetPid, packetCount as uint, speed,
+							packetChecksum, packetToken, expected)
 					}
 
 					completionPulse = true
@@ -206,11 +211,11 @@ component PacketReceiver<CAPACITY: int = 64, STYLE: MemoryStyle = MemoryStyle.Bl
 					if (result == PacketError.None && !blocked) {
 						published = true
 						acceptPulse = true
-						publishedPid = receivePid
+						publishedPid = packetPid
 						publishedLength = 0
 
-						if (PacketPid.IsData(receivePid)) {
-							publishedLength = (byteCount as uint) - PacketIntegrity.DATA_OVERHEAD
+						if (PacketPid.IsData(packetPid)) {
+							publishedLength = (packetCount as uint) - PacketIntegrity.DATA_OVERHEAD
 						}
 
 						publishedToken = fields

@@ -28,6 +28,18 @@ context. Counter widths grow with the required counts. Pipeline stages remain
 fixed clock-cycle latencies. A faster context still needs implementation timing
 closure, clock accuracy and electrical verification for the chosen target.
 
+## Pipeline timing
+
+`HostController` and `TransactionEngine` enable `PIPELINE_LINK` by default. The
+added stages use the inherited clock; they do not select a fixed clock frequency
+or change USB bit periods. Disabling the option removes the optional stages,
+while preserving the same supported clock rates and packet-storage contract.
+
+A standalone `PacketTransmitter` defaults to `PIPELINE_OUTPUT = false`; the host
+engine selects it through `PIPELINE_LINK`. Both settings require at least 64
+clocks between PHY byte acceptances. See [link pipeline](host.md#link-pipeline)
+and [transmit pipeline](packets.md#optional-transmit-pipeline) for the boundaries.
+
 ## Host timing
 
 | Timing | Default / unit |

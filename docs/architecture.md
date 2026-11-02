@@ -1,6 +1,6 @@
 # Package architecture
 
-`Livt.Usb 0.0.3` owns portable USB signaling, packets, host services and supported
+`Livt.Usb 0.0.4` owns portable USB signaling, packets, host services and supported
 class handlers. Applications own terminal commands, keyboard layouts and data-use
 policy. Platform integration owns clock generation, reset conditioning, VBUS,
 electrical pads and timing constraints.
@@ -60,6 +60,12 @@ reset invalidates ownership and lengths without requiring RAM contents to clear.
 Alternative backends may have different scheduled latency, but must preserve
 acceptance, completion, ordering and reset semantics. Signal-level backends must
 also preserve their specified edge timing.
+
+Pipeline selection is independent of storage selection. `HostController` and
+`TransactionEngine` default to `PIPELINE_LINK = true`, while direct
+`PacketTransmitter` instances default to `PIPELINE_OUTPUT = false`. These choices
+trade register stages and latency for shorter combinational paths; they preserve
+packet contents and retained ownership. See [link pipeline](host.md#link-pipeline).
 
 See [host contracts](host-controller.md), [host operation](host.md),
 [PHY signaling](phy.md), [packet processing](packets.md) and

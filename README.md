@@ -7,7 +7,7 @@ library alongside `Livt.IO`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
-Version 0.0.3 provides:
+Version 0.0.4 provides:
 
 - `Livt.Usb.IO.Usb2Phy`: low-speed and full-speed signaling with context-derived timing.
 - `Livt.Usb.Packets`: token, data and handshake processing with PID and CRC checks.
@@ -18,13 +18,14 @@ Version 0.0.3 provides:
 - `Livt.Usb.Hid.BootKeyboardHost`: boot-keyboard initialization, polling and usage events.
 - `Livt.Usb.MassStorage`: read-only SCSI Bulk-Only Transport and retained block reads.
 - Configurable buffering with BRAM defaults and alternative storage providers.
+- Configurable host and packet-transmit pipelines for timing and latency tradeoffs.
 - `Livt.Usb.Testing.TestHostController`: a deterministic controller test double.
 
 ## 📦 Package
 
 ```toml
 [dependencies]
-"Livt.Usb" = "0.0.3"
+"Livt.Usb" = "0.0.4"
 ```
 
 `Livt.IO 1.7.0` supplies memory interfaces, storage implementations and the
@@ -68,6 +69,12 @@ before using received data. Completion remains available until released.
 service. One scheduled client serializes controller access. Control and interrupt
 transfers support low/full speed; bulk transfers support full speed. Transfer
 storage defaults to 512 bytes per input/output store.
+
+`PIPELINE_LINK` defaults to `true`, registering receive signals, ACK decisions,
+frame admission and transmit feedback, and enabling the packet output pipeline.
+Set it to `false` for the direct path when lower latency is preferred. Both
+settings preserve transfer ownership, completion and packet-memory contracts.
+See [link pipeline](docs/host.md#link-pipeline) for configuration and timing.
 
 `DeviceEnumerator` discovers device and configuration descriptors, assigns address
 one and selects the first configuration. `ControlTransfer` constructs control
@@ -179,6 +186,8 @@ livt build --release -W all,error
 The package's [tests](tests/) cover transfer contracts, descriptor parsing,
 keyboard transitions, queue behavior, mass-storage framing and recovery, retained
 block reads, storage alternatives and root-port timing across clock contexts.
+Transaction tests exercise both pipeline settings against the physical transmit
+serializer, including packet bytes, CRCs, ACK handoff and cancellation.
 
 ## 🛠️ Development Notes
 
@@ -189,9 +198,10 @@ block reads, storage alternatives and root-port timing across clock contexts.
 
 ## 🚧 Scope and Outlook
 
-Version 0.0.3 supports one directly attached low/full-speed device, one active or
-retained host request, boot-keyboard HID and full-speed read-only mass storage. Standard discovery defaults to a
-512-byte configuration bound, four interfaces and three nonzero endpoints plus EP0.
+Version 0.0.4 supports one directly attached low/full-speed device, one active or
+retained host request, boot-keyboard HID and full-speed read-only mass storage.
+Standard discovery defaults to a 512-byte configuration bound, four interfaces
+and three nonzero endpoints plus EP0.
 Only alternate setting zero and the first configuration are selected.
 
 Hubs, high speed, isochronous transfers, USB device role, arbitrary HID report

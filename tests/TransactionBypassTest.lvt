@@ -1,0 +1,29 @@
+namespace Livt.Usb.Tests
+
+/**
+ * Checks the caller-selectable minimum-latency link boundary.
+ */
+@Test
+@Context(ClockFrequency = 96MHz)
+component TransactionBypassTest
+{
+	// Owned probe for this pipeline configuration.
+	probe: TransactionPipelineProbe<false>
+
+	/**
+	 * Creates the configured protocol probe.
+	 */
+	new()
+	{
+		probe = new TransactionPipelineProbe<false>()
+	}
+
+	/**
+	 * Verifies the same protocol behavior without the optional registers.
+	 */
+	@Test
+	fn PreservesTransactions()
+	{
+		probe.Run()
+	}
+}

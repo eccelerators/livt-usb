@@ -111,3 +111,13 @@ constraints from chapter 7: https://www.usb.org/document-library/usb-20-specific
 
 Host transactions, retries and enumeration use this layer through
 `TransactionEngine` and `HostController`.
+
+## Optional transmit pipeline
+
+The final `PacketTransmitter` generic `PIPELINE_OUTPUT: bool = false`, added in 0.0.4,
+selects a registered phase-to-byte boundary. `false` retains direct byte publication;
+`true` publishes the byte and valid together one edge after phase advancement.
+Both require the PHY's existing minimum 64 clocks between byte acceptances and
+retain the synchronous packet-memory contract. `TransactionEngine` selects this
+option through its own `PIPELINE_LINK` generic, which defaults to `true` and also
+registers PHY feedback. See [link pipeline](host.md#link-pipeline).

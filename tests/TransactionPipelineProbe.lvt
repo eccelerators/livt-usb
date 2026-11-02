@@ -1,0 +1,326 @@
+namespace Livt.Usb.Tests
+
+using Livt.IO
+using Livt.Usb
+using Livt.Usb.Host
+using Livt.Usb.IO
+using Livt.Usb.Packets
+
+/**
+ * Uses the real transmit PHY and independent receive CRC and token vectors.
+ * Both pipeline configurations must preserve packet contents, ACK timing,
+ * duplicate handling, invalid-CRC rejection and cancellation before publication.
+ */
+component TransactionPipelineProbe<PIPELINED: bool>
+{
+	// Owned transaction engine and physical transmitter in the inherited context.
+	engine: TransactionEngine<MemoryStyle.Block,
+		SynchronousRam<byte, uint, 64, MemoryStyle.Block>, PIPELINED>
+	wire: Usb2PacketTransmitter
+
+	// Accepted wire bytes and the scheduled consumer position.
+	sent: byte[64]
+	sentCount: uint
+	consumed: uint
+
+	// Independent edge counts used to bound ACK handoff.
+	ticks: uint
+	wasReceiving: bool
+	eopTick: uint
+	ackTick: uint
+	ackSeen: bool
+
+	/**
+	 * Owns the real transaction engine in the test's 96 MHz context.
+	 */
+	new()
+	{
+		engine = new TransactionEngine<MemoryStyle.Block,
+			SynchronousRam<byte, uint, 64, MemoryStyle.Block>, PIPELINED>()
+		wire = new Usb2PacketTransmitter(UsbSpeed.Full, true, engine.cancel,
+			engine.txValid, engine.txData, false)
+	}
+
+	/**
+	 * Uses actual PHY ready/busy behavior, including ready held high while idle.
+	 */
+	process Ports[]()
+	{
+		engine.phyReady = wire.ready
+		engine.phyBusy = wire.busy
+		engine.keepReady = wire.keepAliveReady
+	}
+
+	/**
+	 * Counts physical edges independently of scheduled stimulus calls.
+	 */
+	process Count()
+	{
+		state {
+			ticks++
+
+			if (wasReceiving && !engine.rxActive) {
+				eopTick = ticks
+				ackSeen = false
+			}
+
+			if (wire.ready && engine.txValid) {
+				assert sentCount < 64
+				sent[sentCount as int] = engine.txData
+				sentCount++
+
+				if (engine.txData == PacketPid.ACK) {
+					ackTick = ticks
+					ackSeen = true
+				}
+			}
+
+			wasReceiving = engine.rxActive
+		}
+	}
+
+	/**
+	 * Establishes an idle full-speed PHY and an empty request mailbox.
+	 */
+	fn Initialize()
+	{
+		engine.cancel = true
+		engine.connected = true
+		engine.speed = UsbSpeed.Full
+		engine.frameTick = false
+		engine.frame = 0
+		engine.frameRemaining = 96000
+		engine.rxActive = false
+		engine.rxValid = false
+		engine.rxData = 0
+		engine.rxError = false
+		engine.clearRequest = false
+		engine.loadRequest = false
+		engine.loadData = 0
+		engine.request = false
+		engine.tokenPid = PacketPid.IN
+		engine.token = 0
+		engine.dataOne = false
+		engine.maxLength = 64
+		engine.readRequest = false
+		engine.readAddress = 0
+		Simulation.Wait(8)
+		engine.cancel = false
+		Simulation.Wait(8)
+	}
+
+	/**
+	 * Checks the next byte actually accepted by the physical serializer.
+	 */
+	fn AcceptByte(expected: byte)
+	{
+		var waited = 0
+
+		while (sentCount == consumed && waited < 200) {
+			Simulation.Wait(1)
+			waited++
+		}
+
+		assert sentCount > consumed
+		assert sent[consumed as int] == expected
+		consumed++
+	}
+
+	/**
+	 * Waits through physical EOP before supplying a synthetic device response.
+	 */
+	fn FinishTransmit()
+	{
+		var waited = 0
+
+		while (engine.phyBusy && waited < 1000) {
+			Simulation.Wait(1)
+			waited++
+		}
+
+		assert !engine.phyBusy
+	}
+
+	/**
+	 * Sends a token to address/endpoint zero; token CRC bytes are 00 10.
+	 */
+	fn BeginToken(pid: byte)
+	{
+		var waited = 0
+
+		while (!engine.ready && waited < 1000) {
+			Simulation.Wait(1)
+			waited++
+		}
+
+		assert engine.ready
+		engine.tokenPid = pid
+		engine.request = !engine.request
+		AcceptByte(pid)
+		Simulation.Wait(64)
+		AcceptByte(0)
+		Simulation.Wait(64)
+		AcceptByte(0x10)
+		Simulation.Wait(64)
+		FinishTransmit()
+		Simulation.Wait(8)
+	}
+
+	/**
+	 * Presents a single accepted RX byte with full-speed byte pacing.
+	 */
+	fn SendByte(value: byte)
+	{
+		state {
+			engine.rxData = value
+			engine.rxValid = true
+		}
+
+		state {
+			engine.rxValid = false
+		}
+
+		Simulation.Wait(64)
+	}
+
+	/**
+	 * Payload A5 has independently calculated USB CRC16 bytes 80 C4.
+	 */
+	fn SendData(pid: byte, corrupt: bool, cancelAtEnd: bool)
+	{
+		engine.rxActive = true
+		SendByte(pid)
+		SendByte(0xA5)
+		SendByte(0x80)
+
+		if (corrupt) {
+			SendByte(0xC5)
+		} else {
+			SendByte(0xC4)
+		}
+
+		state {
+			engine.rxActive = false
+			engine.cancel = cancelAtEnd
+		}
+	}
+
+	/**
+	 * Requires retained completion and the intended result, with no stale read.
+	 */
+	fn AwaitResult(expected: TransactionResult)
+	{
+		var waited = 0
+
+		while (!engine.completed && waited < 500) {
+			Simulation.Wait(1)
+			waited++
+		}
+
+		assert engine.completed
+		assert engine.result == expected
+	}
+
+	/**
+	 * Stages one payload byte through the retained load-toggle mailbox.
+	 */
+	fn LoadByte(value: byte)
+	{
+		engine.loadData = value
+		engine.loadRequest = !engine.loadRequest
+		var waited = 0
+
+		while (engine.loadAccepted != engine.loadRequest && waited < 200) {
+			Simulation.Wait(1)
+			waited++
+		}
+
+		assert engine.loadAccepted == engine.loadRequest
+	}
+
+	/**
+	 * Checks two-byte OUT prefetch and CRC through real PHY byte acceptance.
+	 */
+	fn CheckOutput()
+	{
+		engine.clearRequest = !engine.clearRequest
+		var waited = 0
+
+		while (engine.clearAccepted != engine.clearRequest && waited < 200) {
+			Simulation.Wait(1)
+			waited++
+		}
+
+		assert engine.clearAccepted == engine.clearRequest
+		LoadByte(0xA5)
+		LoadByte(0x5A)
+		BeginToken(PacketPid.OUT)
+		var expectedCount = consumed + 5
+		waited = 0
+
+		while (sentCount < expectedCount && waited < 1000) {
+			Simulation.Wait(1)
+			waited++
+		}
+
+		assert sentCount == expectedCount
+		FinishTransmit()
+		engine.rxActive = true
+		SendByte(PacketPid.ACK)
+		engine.rxActive = false
+		AwaitResult(TransactionResult.Success)
+		assert engine.acknowledged
+		AcceptByte(PacketPid.DATA0)
+		AcceptByte(0xA5)
+		AcceptByte(0x5A)
+		AcceptByte(0x05)
+		AcceptByte(0x24)
+	}
+
+	/**
+	 * Checks real packet transmission and response decisions in both configurations.
+	 */
+	public fn Run()
+	{
+		Initialize()
+		engine.frameRemaining = 19200
+		Simulation.Wait(4)
+		assert !engine.ready
+		engine.frameRemaining = 19202
+		Simulation.Wait(4)
+		assert engine.ready
+		engine.frameRemaining = 96000
+		Simulation.Wait(4)
+		BeginToken(PacketPid.IN)
+		SendData(PacketPid.DATA0, false, false)
+		AcceptByte(PacketPid.ACK)
+		assert ackSeen && ackTick - eopTick < 40
+		FinishTransmit()
+		AwaitResult(TransactionResult.Success)
+		assert engine.acknowledged && engine.length == 1
+		engine.readRequest = true
+		Simulation.Wait(4)
+		assert engine.readValid && engine.readData == 0xA5
+		engine.readRequest = false
+
+		BeginToken(PacketPid.IN)
+		SendData(PacketPid.DATA1, false, false)
+		AcceptByte(PacketPid.ACK)
+		assert ackSeen && ackTick - eopTick < 40
+		FinishTransmit()
+		AwaitResult(TransactionResult.Duplicate)
+		assert !engine.acknowledged
+
+		BeginToken(PacketPid.IN)
+		SendData(PacketPid.DATA0, true, false)
+		AwaitResult(TransactionResult.ProtocolError)
+		Simulation.Wait(64)
+		assert !engine.txValid && !engine.acknowledged
+
+		CheckOutput()
+		BeginToken(PacketPid.IN)
+		SendData(PacketPid.DATA0, false, true)
+		AwaitResult(TransactionResult.Disconnected)
+		assert !engine.txValid && !engine.readValid && !engine.acknowledged
+	}
+}

@@ -77,6 +77,57 @@ defaults above. `HostController` exposes `PORT_DEBOUNCE_US`, `PORT_RESET_US` and
 Retain the defaults in production. See [clock configuration](clocking.md) for
 clock constraints, timing units and counter sizing.
 
+## Link pipeline
+
+Since 0.0.4, the `PIPELINE_LINK: bool = true` parameter is appended to both
+`HostController` and `TransactionEngine`. Existing generic arguments keep their
+positions. `HostController` forwards the choice to its engine.
+
+| Component | Generic | Default |
+|---|---|---|
+| `HostController` | `PIPELINE_LINK` | `true` |
+| `TransactionEngine` | `PIPELINE_LINK` | `true` |
+| Standalone `PacketTransmitter` | `PIPELINE_OUTPUT` | `false` |
+
+For a directly composed transaction engine, keep the same packet RAM and choose
+only the pipeline behavior:
+
+```livt
+using Livt.IO
+using Livt.Usb.Host
+
+// Fields in the owning component; construct the matching types in its constructor.
+pipelined: TransactionEngine
+bypass: TransactionEngine<MemoryStyle.Block,
+	SynchronousRam<byte, uint, 64, MemoryStyle.Block>, false>
+```
+
+Both instances own their packet stores. A design normally selects one of these
+configurations; no runtime selector is created. When using `HostController`, its
+final generic selects the same behavior after the storage and root-port parameters.
+
+With the default enabled, the engine samples speed, cancellation, RX activity,
+byte validity, data and physical errors together in an ingress register stage.
+It also registers release of the retained RX slot and uses a separate state for
+requesting an ACK after validating the received packet. This adds one receive
+sampling edge and one ACK-decision edge, breaking combinational paths between
+PHY observation, packet validation and transmit preparation. Frame admission is
+also registered with one extra clock of reserve: `frameRemaining` must count down
+by one per edge and wrap at `frameTick`, as `RootPort` does. This avoids combining
+the frame-time subtraction with packet launch in one combinational path.
+
+Transmit feedback registers an actual byte acceptance (`valid && ready`) and PHY
+busy state. Registering ready alone would duplicate an idle-ready level. The
+engine also enables the packet transmitter's output pipeline, which publishes
+bytes one edge after its phase advances. The PHY's minimum 64 clocks between
+accepted bytes leaves time for both stages without interrupting a packet.
+
+Set `PIPELINE_LINK` to `false` to bypass these stages when lower latency is more
+useful than the timing separation. The unused ingress registers can then be
+removed by synthesis. Both settings retain the same packet, toggle, cancellation
+and retained-completion contracts. Neither setting changes the memory provider
+or permits an arbitrary-latency packet RAM. Qualify timing in the target design.
+
 ## Enumeration limits
 
 The standard parser bounds configurations to 512 bytes, four interfaces and three

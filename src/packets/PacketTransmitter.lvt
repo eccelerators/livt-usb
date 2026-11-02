@@ -10,9 +10,12 @@ using Livt.Utils.Hashing
  * submits. No load is accepted with clear or request asserted. Staging is frozen
  * during transmission. Completion follows PHY busy falling, not last-byte acceptance.
  * The PHY must pace bytes as IUsb2Phy does (at least 64 clocks between accepts).
+ * PIPELINE_OUTPUT separates byte publication from phase advancement by one edge;
+ * the default false publishes from the updated phase without that extra edge.
  */
 component PacketTransmitter<CAPACITY: int = 64, STYLE: MemoryStyle = MemoryStyle.Block,
-	B: ISynchronousRam<byte, uint, RamGeometry<CAPACITY>> & new() = SynchronousRam<byte, uint, CAPACITY, STYLE>>
+	B: ISynchronousRam<byte, uint, RamGeometry<CAPACITY>> & new() = SynchronousRam<byte, uint, CAPACITY, STYLE>,
+	PIPELINE_OUTPUT: bool = false>
 {
 	static assert CAPACITY > 0 && CAPACITY <= 1023, "Packet capacity must be 1 through 1023"
 
@@ -117,6 +120,11 @@ component PacketTransmitter<CAPACITY: int = 64, STYLE: MemoryStyle = MemoryStyle
 	process Transmit()
 	{
 		state {
+			var outputPhase = phase
+			var outputPid = savedPid
+			var outputPayload = payload
+			var outputChecksum = checksum
+			var outputToken = tokenWord
 			completed = false
 			rejected = false
 
@@ -203,30 +211,38 @@ component PacketTransmitter<CAPACITY: int = 64, STYLE: MemoryStyle = MemoryStyle
 				}
 			}
 
-			wireValid = !cancel && phase >= PID && phase <= TOKEN_HIGH
-			wireData = savedPid
+			static if (!PIPELINE_OUTPUT) {
+				outputPhase = phase
+				outputPid = savedPid
+				outputPayload = payload
+				outputChecksum = checksum
+				outputToken = tokenWord
+			}
 
-			match phase
+			wireValid = !cancel && outputPhase >= PID && outputPhase <= TOKEN_HIGH
+			wireData = outputPid
+
+			match outputPhase
 			{
 				PAYLOAD =>
 				{
-					wireData = payload
+					wireData = outputPayload
 				}
 				CRC_LOW =>
 				{
-					wireData = ((checksum ^ PacketIntegrity.DATA_FINAL_XOR) & 0xFF) as byte
+					wireData = ((outputChecksum ^ PacketIntegrity.DATA_FINAL_XOR) & 0xFF) as byte
 				}
 				CRC_HIGH =>
 				{
-					wireData = ((checksum ^ PacketIntegrity.DATA_FINAL_XOR) >> 8) as byte
+					wireData = ((outputChecksum ^ PacketIntegrity.DATA_FINAL_XOR) >> 8) as byte
 				}
 				TOKEN_LOW =>
 				{
-					wireData = (tokenWord & 0xFF) as byte
+					wireData = (outputToken & 0xFF) as byte
 				}
 				TOKEN_HIGH =>
 				{
-					wireData = (tokenWord >> 8) as byte
+					wireData = (outputToken >> 8) as byte
 				}
 				_ => {}
 			}

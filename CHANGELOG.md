@@ -2,6 +2,39 @@
 
 All notable changes to this package are documented here.
 
+## 0.0.4
+
+### Added
+
+- `PIPELINE_LINK: bool = true` on `TransactionEngine` and `HostController` for
+  configurable receive sampling, ACK decisions, frame admission and transmit
+  feedback. The host forwards this choice to its packet transmitter.
+- `PIPELINE_OUTPUT: bool = false` on `PacketTransmitter` for byte/valid publication
+  one clock edge after phase advancement. Direct packet users retain the default
+  unpipelined behavior.
+- Transaction tests against the physical transmit serializer for both settings,
+  covering IN/OUT bytes, CRCs, retained payloads, duplicate acknowledgement,
+  cancellation, frame admission and bounded ACK handoff.
+
+### Changed
+
+- The default host separates PHY observation, receive processing and transmit
+  preparation with pipeline stages. Set `PIPELINE_LINK` to `false` for the direct
+  path with lower latency.
+- Receive completion uses the byte count and checksum before EOP, avoiding the
+  active-byte update path without changing packet publication timing.
+
+### Compatibility and dependencies
+
+- New generics are appended, preserving existing positional arguments. Default
+  host wire timing gains pipeline cycles; scheduled transfer ownership and
+  retained-completion semantics remain unchanged.
+- Packet storage providers retain their synchronous read-response contract, and
+  PHY byte acceptance must remain at least 64 clocks apart. Pipeline selection
+  does not permit arbitrary memory latency.
+- Continue to use published `Livt.IO 1.7.0` and `Livt.Utils 1.1.0`. No filesystem,
+  UART, CLI or board dependency is introduced.
+
 ## 0.0.3
 
 ### Added

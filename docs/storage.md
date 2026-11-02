@@ -93,13 +93,18 @@ retained block data and endpoint metadata. The providers have parameterless
 constructors and are owned exclusively by their components. Scheduled operations
 wait for completion, so compatible providers may trade resources for extra cycles.
 
-`HostController` additionally forwards its final `PACKET_STORAGE` generic to
+`HostController` additionally forwards its `PACKET_STORAGE` generic to
 `TransactionEngine`. Its default is `SynchronousRam<byte, uint, 64, STYLE>`;
 `STYLE` therefore reaches both scheduled transfer storage and wire-packet memory.
 A custom packet provider must implement
 `ISynchronousRam<byte, uint, RamGeometry<64>>` and preserve its accepting edge and
 read-response timing. This signal-level contract does not allow arbitrary extra
 read cycles. Each packet owner constructs its own provider instance.
+
+The separate `PIPELINE_LINK` generic defaults to `true` and selects register stages
+for receive sampling, ACK decisions, frame admission and transmit feedback/output.
+It does not select packet memory or change its one-edge contract;
+see [link pipeline](host.md#link-pipeline) for the latency tradeoff.
 
 Small descriptor headers and control fields remain register arrays. Moving tiny
 buffers to scheduled RAM can cost more control logic than it saves in data storage;

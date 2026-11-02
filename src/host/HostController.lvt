@@ -10,12 +10,15 @@ using Livt.Usb.Packets
  * One scheduled client owns staging, submission, reading and release. An independent
  * worker owns accepted storage until completion. Each endpoint/direction retains its
  * toggle; reset disconnects, cancels active work and clears all toggles.
+ * PIPELINE_LINK defaults to registered link stages; false selects the direct path.
+ * Both settings share the inherited clock/reset and preserve storage ownership.
  */
 component HostController<CAPACITY: int = 512, STYLE: MemoryStyle = MemoryStyle.Block,
 	B: IRam<byte> & new() = SequentialRam<byte, CAPACITY, STYLE>,
 	PORT_DEBOUNCE_US: int = 100000, PORT_RESET_US: int = 12000, PORT_RECOVERY_US: int = 10000,
 	P: IRam<logic[16]> & new() = SequentialRam<logic[16], 32, STYLE>,
-	PACKET_STORAGE: ISynchronousRam<byte, uint, RamGeometry<64>> & new() = SynchronousRam<byte, uint, 64, STYLE>> : IHostController
+	PACKET_STORAGE: ISynchronousRam<byte, uint, RamGeometry<64>> & new() = SynchronousRam<byte, uint, 64, STYLE>,
+	PIPELINE_LINK: bool = true> : IHostController
 {
 	static assert CAPACITY >= 8 && CAPACITY <= 65535, "Transfer capacity must be 8..65535"
 
@@ -25,7 +28,7 @@ component HostController<CAPACITY: int = 512, STYLE: MemoryStyle = MemoryStyle.B
 	// Owned link, transaction engine, validation and independent staging/input RAM.
 	phy: Usb2Phy
 	port: RootPort<PORT_DEBOUNCE_US, PORT_RESET_US, PORT_RECOVERY_US>
-	engine: TransactionEngine<STYLE, PACKET_STORAGE>
+	engine: TransactionEngine<STYLE, PACKET_STORAGE, PIPELINE_LINK>
 	profile: HostProfile<CAPACITY>
 	output: B
 	input: B
@@ -37,6 +40,7 @@ component HostController<CAPACITY: int = 512, STYLE: MemoryStyle = MemoryStyle.B
 	public dpEnable: out logic
 	public dmEnable: out logic
 	public debug: out logic[16]
+
 	// Result code bits 0..3, last wire length 4..10, endpoint 11..14, toggle 15.
 	public transferDiagnostics: out logic[16]
 
@@ -89,7 +93,7 @@ component HostController<CAPACITY: int = 512, STYLE: MemoryStyle = MemoryStyle.B
 	{
 		phy = new Usb2Phy(dp, dm)
 		port = new RootPort<PORT_DEBOUNCE_US, PORT_RESET_US, PORT_RECOVERY_US>()
-		engine = new TransactionEngine<STYLE, PACKET_STORAGE>()
+		engine = new TransactionEngine<STYLE, PACKET_STORAGE, PIPELINE_LINK>()
 		profile = new HostProfile<CAPACITY>()
 		output = new B()
 		input = new B()

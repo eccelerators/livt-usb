@@ -11,9 +11,14 @@ using Livt.Usb.Packets
  * every attempt consumes staging. completed is retained until the next acceptance.
  * Valid IN data is ACKed here before any scheduled payload access; duplicates are
  * ACKed but reported separately. One retained RX slot is released on next request.
+ * All bindings share one clock/reset context. PIPELINE_LINK adds coherent receive,
+ * ACK, frame-admission and transmit stages; false selects the direct path.
+ * frameRemaining counts down once per edge and wraps at frameTick. The PHY must
+ * leave at least 64 clocks between byte acceptances in either configuration.
  */
 component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
-	B: ISynchronousRam<byte, uint, RamGeometry<64>> & new() = SynchronousRam<byte, uint, 64, STYLE>>
+	B: ISynchronousRam<byte, uint, RamGeometry<64>> & new() = SynchronousRam<byte, uint, 64, STYLE>,
+	PIPELINE_LINK: bool = true>
 {
 	// Physical durations use exact context rates to avoid TicksFor clock-period rounding.
 	const CLOCK_HZ: uint = this.context.TicksPer(1Hz)
@@ -29,7 +34,7 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 
 	// Independent packet stores and cycle-level link context.
 	rx: PacketReceiver<64, STYLE, B>
-	tx: PacketTransmitter<64, STYLE, B>
+	tx: PacketTransmitter<64, STYLE, B, PIPELINE_LINK>
 	public speed: in UsbSpeed
 	public connected: in bool
 	public cancel: in bool
@@ -83,6 +88,7 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 	const FRAME: logic[4] = 5
 	const KEEP: logic[4] = 6
 	const KEEP_WAIT: logic[4] = 7
+	const ACK_REQUEST: logic[4] = 8
 	phase: logic[4]
 	savedPid: byte
 	savedOne: bool
@@ -96,6 +102,18 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 	outcome: TransactionResult
 	receivedLength: uint
 
+	// Optional coherent ingress, RX-slot release, frame admission and TX feedback.
+	linkSpeed: UsbSpeed
+	linkCancel: bool
+	linkActive: bool
+	linkValid: bool
+	linkData: byte
+	linkError: bool
+	releasePending: bool
+	frameOpen: bool
+	linkAccepted: bool
+	linkBusy: bool
+
 	/**
 	 * Creates two 64-byte packet slots; the owner supplies a PHY in the same clock context.
 	 */
@@ -103,7 +121,7 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 	{
 		assert CLOCK_HZ % 12000000 == 0, "USB transaction clock must be an exact multiple of 12 MHz"
 		rx = new PacketReceiver<64, STYLE, B>()
-		tx = new PacketTransmitter<64, STYLE, B>()
+		tx = new PacketTransmitter<64, STYLE, B, PIPELINE_LINK>()
 	}
 
 	/**
@@ -112,35 +130,72 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 	 */
 	process Ports[]()
 	{
-		rx.speed = speed
-		rx.cancel = cancel || !connected
-		rx.active = rxActive
-		rx.valid = rxValid
-		rx.data = rxData
-		rx.physicalError = rxError
-		rx.release = request != acceptedRequest && ready
+		static if (PIPELINE_LINK) {
+			rx.speed = linkSpeed
+			rx.cancel = linkCancel
+			rx.active = linkActive
+			rx.valid = linkValid
+			rx.data = linkData
+			rx.physicalError = linkError
+			rx.release = releasePending
+		} else {
+			rx.speed = speed
+			rx.cancel = cancel || !connected
+			rx.active = rxActive
+			rx.valid = rxValid
+			rx.data = rxData
+			rx.physicalError = rxError
+			rx.release = request != acceptedRequest && ready
+		}
+
 		rx.readRequest = readRequest
 		rx.readAddress = readAddress
 		readData = rx.readData
-		readValid = rx.readValid
+		readValid = rx.readValid && !cancel
 		tx.speed = speed
 		tx.cancel = cancel
-		tx.phyReady = phyReady
-		tx.phyBusy = phyBusy
+
+		static if (PIPELINE_LINK) {
+			tx.phyReady = linkAccepted
+			tx.phyBusy = linkBusy
+		} else {
+			tx.phyReady = phyReady
+			tx.phyBusy = phyBusy
+		}
+
 		tx.clear = clearRequest != clearSeen && phase == IDLE && !tx.busy
 		tx.loadValid = loadRequest != loadSeen && phase == IDLE
 		tx.loadData = loadData
 		loadReady = tx.loadReady && phase == IDLE
 		startLimit = FULL_BIT_TICKS * 18
 
-		if (speed == UsbSpeed.Low) { startLimit = LOW_BIT_TICKS * 18 }
+		if (speed == UsbSpeed.Low) {
+			startLimit = LOW_BIT_TICKS * 18
+		}
+
+		var admitFrame: bool
+
+		static if (PIPELINE_LINK) {
+			admitFrame = frameOpen
+		} else {
+			admitFrame = frameRemaining > FRAME_GUARD_TICKS
+		}
 
 		ready = connected && !cancel && phase == IDLE && !pendingFrame
-			&& !frameTick && frameRemaining > FRAME_GUARD_TICKS && gap == 0 && tx.ready && !rxActive
+			&& !frameTick && admitFrame && gap == 0 && tx.ready && !rxActive
 		tx.request = false
 		tx.pid = tokenPid
 		tx.token = token
 		keepAlive = phase == KEEP && !cancel
+
+		var ackCommand: bool
+
+		static if (PIPELINE_LINK) {
+			ackCommand = phase == ACK_REQUEST
+		} else {
+			ackCommand = phase == RESPONSE && rx.accepted && savedPid == PacketPid.IN
+				&& PacketPid.IsData(rx.pid) && rx.length <= savedLimit
+		}
 
 		if (phase == IDLE && pendingFrame && gap == 0 && tx.ready && !rxActive) {
 			if (speed == UsbSpeed.Full) {
@@ -154,9 +209,10 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 			tx.request = true
 			tx.pid = PacketPid.DATA0
 
-			if (savedOne) { tx.pid = PacketPid.DATA1 }
-		} elif (phase == RESPONSE && rx.accepted && savedPid == PacketPid.IN
-			&& PacketPid.IsData(rx.pid) && rx.length <= savedLimit) {
+			if (savedOne) {
+				tx.pid = PacketPid.DATA1
+			}
+		} elif (ackCommand) {
 			tx.request = true
 			tx.pid = PacketPid.ACK
 		}
@@ -174,12 +230,38 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 	}
 
 	/**
+	 * Samples coherent receive signals, accepted transmit bytes and frame admission.
+	 * The frame countdown reserves one edge for sampling. Bypassed registers are
+	 * unreferenced when PIPELINE_LINK is false and are removed by synthesis.
+	 */
+	process CaptureLink()
+	{
+		state {
+			linkSpeed = speed
+			linkCancel = cancel || !connected
+			linkActive = rxActive
+			linkValid = rxValid
+			linkData = rxData
+			linkError = rxError
+
+			// Ready may remain high while idle; retain only a real byte acceptance.
+			linkAccepted = phyReady && tx.txValid
+			linkBusy = phyBusy
+
+			// The root-port counter falls by one per edge; reserve that sampling edge.
+			frameOpen = frameRemaining > FRAME_GUARD_TICKS + 1
+		}
+	}
+
+	/**
 	 * Bounds a response including wire payload to 128 us and keeps frame traffic
-	 * alive even while the client drains its retained completion over a slow UART.
+	 * alive while the scheduled client drains its retained completion.
 	 */
 	process Exchange()
 	{
 		state {
+			releasePending = false
+
 			if (cancel) {
 				// Cancellation cannot undo a completed wire ACK. Preserve its commit
 				// observation until the next command, including an ACK completing now.
@@ -205,9 +287,13 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 				done = true
 				gap = 0
 			} else {
-				if (tx.clear) { clearSeen = clearRequest }
+				if (tx.clear) {
+					clearSeen = clearRequest
+				}
 
-				if (tx.loadValid && tx.loadReady) { loadSeen = loadRequest }
+				if (tx.loadValid && tx.loadReady) {
+					loadSeen = loadRequest
+				}
 
 				match phase
 				{
@@ -216,10 +302,13 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 						if (pendingFrame && gap == 0 && tx.ready && !rxActive) {
 							phase = FRAME
 
-							if (speed == UsbSpeed.Low) { phase = KEEP }
+							if (speed == UsbSpeed.Low) {
+								phase = KEEP
+							}
 
 							pendingFrame = false
 						} elif (request != acceptedRequest && ready) {
+							releasePending = true
 							acceptedRequest = request
 							savedPid = tokenPid
 							savedOne = dataOne
@@ -235,7 +324,9 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 						if (tx.completed) {
 							phase = DATA
 
-							if (savedPid == PacketPid.IN) { phase = RESPONSE }
+							if (savedPid == PacketPid.IN) {
+								phase = RESPONSE
+							}
 
 							responseCycles = 0
 							responseStarted = false
@@ -253,25 +344,38 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 					{
 						responseCycles++
 
-						if (rxActive) { responseStarted = true }
+						if (rxActive) {
+							responseStarted = true
+						}
 
 						if (rx.completed) {
 							outcome = TransactionResult.ProtocolError
 
 							if (rx.accepted) {
-								if (rx.pid == PacketPid.NAK) { outcome = TransactionResult.Nak } elif (rx.pid == PacketPid.STALL) { outcome = TransactionResult.Stall } elif (savedPid != PacketPid.IN && rx.pid == PacketPid.ACK) {
+								if (rx.pid == PacketPid.NAK) {
+									outcome = TransactionResult.Nak
+								} elif (rx.pid == PacketPid.STALL) {
+									outcome = TransactionResult.Stall
+								} elif (savedPid != PacketPid.IN && rx.pid == PacketPid.ACK) {
 									outcome = TransactionResult.Success
 								} elif (savedPid == PacketPid.IN && PacketPid.IsData(rx.pid) && rx.length <= savedLimit) {
 									outcome = TransactionResult.Success
 
-									if ((rx.pid == PacketPid.DATA1) != savedOne) { outcome = TransactionResult.Duplicate }
+									if ((rx.pid == PacketPid.DATA1) != savedOne) {
+										outcome = TransactionResult.Duplicate
+									}
 
 									receivedLength = rx.length
-									phase = ACK
+
+									static if (PIPELINE_LINK) {
+										phase = ACK_REQUEST
+									} else {
+										phase = ACK
+									}
 								}
 							}
 
-							if (phase != ACK) {
+							if (phase != ACK && phase != ACK_REQUEST) {
 								done = true
 								phase = IDLE
 								gap = (GAP_TICKS as int) as logic[GAP_BITS]
@@ -283,6 +387,12 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 							done = true
 							phase = IDLE
 							gap = (GAP_TICKS as int) as logic[GAP_BITS]
+						}
+					}
+					ACK_REQUEST =>
+					{
+						if (tx.ready) {
+							phase = ACK
 						}
 					}
 					ACK =>
@@ -302,7 +412,9 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 					}
 					KEEP =>
 					{
-						if (keepReady) { phase = KEEP_WAIT }
+						if (keepReady) {
+							phase = KEEP_WAIT
+						}
 					}
 					KEEP_WAIT =>
 					{
@@ -318,9 +430,13 @@ component TransactionEngine<STYLE: MemoryStyle = MemoryStyle.Block,
 				}
 			}
 
-			if (frameTick && !cancel) { pendingFrame = true }
+			if (frameTick && !cancel) {
+				pendingFrame = true
+			}
 
-			if (gap != 0) { gap-- }
+			if (gap != 0) {
+				gap--
+			}
 		}
 	}
 }
