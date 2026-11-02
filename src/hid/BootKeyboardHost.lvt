@@ -1,5 +1,6 @@
 namespace Livt.Usb.Hid
 
+using Livt.IO
 using Livt.Usb
 using Livt.Usb.Host
 
@@ -8,11 +9,11 @@ using Livt.Usb.Host
  * Owns the controller's sole scheduled client. Exposes a bounded queue of HID usage
  * transitions; application owns layout, text, repeat and LEDs. No hub/report protocol.
  */
-component BootKeyboardHost : IKeyboardSource
+component BootKeyboardHost<ENDPOINT_STORAGE: IRam<byte> & new() = SequentialRam<byte, 32, MemoryStyle.Block>> : IKeyboardSource
 {
 	// Borrowed controller and owned discovery, class setup, report parser and queue.
 	controller: IHostController
-	enumerator: DeviceEnumerator
+	enumerator: DeviceEnumerator<512, ENDPOINT_STORAGE>
 	control: ControlTransfer
 	parser: BootKeyboardReportParser
 	events: KeyboardEventQueue
@@ -36,7 +37,7 @@ component BootKeyboardHost : IKeyboardSource
 	new(controller: IHostController)
 	{
 		this.controller = controller
-		enumerator = new DeviceEnumerator(controller)
+		enumerator = new DeviceEnumerator<512, ENDPOINT_STORAGE>(controller)
 		control = new ControlTransfer(controller)
 		parser = new BootKeyboardReportParser()
 		events = new KeyboardEventQueue()

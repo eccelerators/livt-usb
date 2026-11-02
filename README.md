@@ -1,12 +1,13 @@
 # Livt.Usb
 
 `Livt.Usb` provides reusable USB components for Livt FPGA applications. It combines
-low/full-speed signaling, packet processing, host transfers, device discovery and
-HID boot-keyboard support in a separate base library alongside `Livt.IO`.
+low/full-speed signaling, packet processing, host transfers and device discovery
+with HID boot-keyboard and read-only mass-storage support. It is a separate base
+library alongside `Livt.IO`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
-Version 0.0.2 provides:
+Version 0.0.3 provides:
 
 - `Livt.Usb.IO.Usb2Phy`: low-speed and full-speed signaling with context-derived timing.
 - `Livt.Usb.Packets`: token, data and handshake processing with PID and CRC checks.
@@ -15,6 +16,7 @@ Version 0.0.2 provides:
 - `Livt.Usb.Host.DeviceEnumerator`: standard descriptor discovery and configuration.
 - `Livt.Usb.Descriptors`: bounded device, interface and endpoint parsing.
 - `Livt.Usb.Hid.BootKeyboardHost`: boot-keyboard initialization, polling and usage events.
+- `Livt.Usb.MassStorage`: read-only SCSI Bulk-Only Transport and retained block reads.
 - Configurable buffering with BRAM defaults and alternative storage providers.
 - `Livt.Usb.Testing.TestHostController`: a deterministic controller test double.
 
@@ -22,14 +24,16 @@ Version 0.0.2 provides:
 
 ```toml
 [dependencies]
-"Livt.Usb" = "0.0.2"
+"Livt.Usb" = "0.0.3"
 ```
 
-The library uses `Livt.IO 1.6.0` for memory interfaces and implementations and
-`Livt.Utils 1.1.0` for generic CRC helpers. Both dependencies are pinned to
-published package versions and resolved from the registry; no sibling library
-checkouts are required. Applications using their types directly should also
-declare those dependencies.
+`Livt.IO 1.7.0` supplies memory interfaces, storage implementations and the
+transport-independent `IReadOnlyBlockDevice` contract. `Livt.Utils 1.1.0` supplies
+generic CRC helpers. Applications using their types directly should also declare
+those dependencies.
+
+Both dependencies are pinned to published registry versions and resolved by
+`livt sync`. No sibling library checkouts are required.
 
 `Livt.Usb` has no UART or CLI dependency. Applications supply their own transport,
 commands and presentation; platform integration supplies clocks, reset and I/O pads.
@@ -44,6 +48,7 @@ commands and presentation; platform integration supplies clocks, reset and I/O p
 | `Livt.Usb.Host` | `HostController`, `RootPort`, `TransactionEngine`, `ControlTransfer`, `DeviceEnumerator`, `HostProfile`, `TransferStorage` | Host timing, transfers and discovery |
 | `Livt.Usb.Descriptors` | `DeviceDescriptorParser`, `ConfigurationDescriptorParser` | Bounded descriptor parsing |
 | `Livt.Usb.Hid` | `BootKeyboardHost`, `BootKeyboardReportParser`, `KeyboardEventQueue`, `IKeyboardSource`, `BootKeyboardBinding` | Boot-keyboard lifecycle and usage transitions |
+| `Livt.Usb.MassStorage` | `MassStorageHost`, `BulkOnlyTransport`, `ReadOnlyScsiCommand` | Read-only SCSI commands, BOT recovery and retained block access |
 | `Livt.Usb.Testing` | `TestHostController` | Manually driven controller for tests |
 
 USB signaling and PHY adapters belong to `Livt.Usb.IO`; general-purpose I/O stays
@@ -79,6 +84,20 @@ presses; disconnect releases held state. Queue overflow is observable.
 Applications own keyboard layout, key-to-text conversion, Caps Lock policy, LEDs
 and repeat behavior. The library reports usages and modifiers without choosing a
 terminal or character encoding. See [keyboard reports and events](docs/host.md#keyboard-reports-and-events).
+
+### Read-only mass storage
+
+`MassStorageHost` owns enumeration, interface selection and SCSI initialization
+through one host controller. It implements `Livt.IO.IReadOnlyBlockDevice` for
+one retained 512-byte block. Submit an LBA, wait for completion, read the bytes,
+then release the block. Consumers can pause between reads without losing data;
+failed commands and disconnects invalidate the payload.
+
+The supported profile is a directly attached full-speed SCSI-transparent
+Bulk-Only Transport device, LUN zero and READ CAPACITY(10). `BulkOnlyTransport`
+validates command status and handles endpoint stalls and reset recovery.
+Filesystems, partitions, filenames and application data processing remain outside
+USB. See [mass storage](docs/mass-storage.md) for ownership, recovery and limits.
 
 ### PHY and packets
 
@@ -142,7 +161,11 @@ payload bytes, excluding PID and CRC. An explicit backend replaces the default;
 Host transfer storage defaults to `SequentialRam`; packet engines use synchronous
 signal-level memory. Match the required interface and timing when substituting
 storage. Style is a synthesis hint; inspect target resource reports for physical
-mapping. See [storage configuration](docs/storage.md) for capacities and reset rules.
+mapping. Endpoint-table providers are selectable through `DeviceEnumerator`,
+`BootKeyboardHost` and `MassStorageHost`; `HostController` also forwards its packet
+memory provider. Scheduled providers may take different numbers of cycles, while
+packet providers must preserve their synchronous response timing. See
+[storage configuration](docs/storage.md) for capacities and reset rules.
 
 ## 🧪 Build and Test
 
@@ -153,9 +176,9 @@ livt test --release -W all,error
 livt build --release -W all,error
 ```
 
-Verification uses the package's [tests](tests/), run with `livt test`. They cover
-transfer contracts, descriptor parsing, keyboard transitions, queue behavior,
-storage alternatives and root-port timing across clock contexts.
+The package's [tests](tests/) cover transfer contracts, descriptor parsing,
+keyboard transitions, queue behavior, mass-storage framing and recovery, retained
+block reads, storage alternatives and root-port timing across clock contexts.
 
 ## 🛠️ Development Notes
 
@@ -166,14 +189,14 @@ storage alternatives and root-port timing across clock contexts.
 
 ## 🚧 Scope and Outlook
 
-Version 0.0.2 supports one directly attached low/full-speed device, one active or
-retained host request, and boot-keyboard HID. Standard discovery defaults to a
+Version 0.0.3 supports one directly attached low/full-speed device, one active or
+retained host request, boot-keyboard HID and full-speed read-only mass storage. Standard discovery defaults to a
 512-byte configuration bound, four interfaces and three nonzero endpoints plus EP0.
 Only alternate setting zero and the first configuration are selected.
 
 Hubs, high speed, isochronous transfers, USB device role, arbitrary HID report
-parsing and mass-storage class transport are not implemented. Full-speed bulk
-support supplies transport primitives, not a USB-stick driver. Type-C connection
+parsing, storage writes, UAS and READ CAPACITY(16) are not implemented. FAT32 and
+other filesystem handling belong above the block-device boundary. Type-C connection
 management and Power Delivery are separate future extensions.
 
 ## 📄 License

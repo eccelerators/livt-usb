@@ -124,11 +124,16 @@ toggles or emulate packet ACK/NAK. Tests supply endpoint descriptors' geometry.
 For model OUT, acknowledged progress is supplied at Complete; cancellation/timeout
 before Complete reports zero, because the model has not simulated any OUT ACK.
 
-Controller substitution is verified through a constructor-bound interface and an
-interface-typed function parameter with alternating nonzero return values. This
-tests scheduled dispatch completion rather than assuming a fixed-cycle return.
-The installed compiler exhibited incorrect lowering for a direct local interface
-alias in the multi-method test fixture. Consumers therefore use constructor
-injection; this is a compiler-specific limitation, not a fixed-latency assumption.
+Bind the controller through the owning component's constructor and serialize
+scheduled calls. Consumers wait for call completion rather than assuming a fixed
+number of cycles.
 The direct physical implementation is `Livt.Usb.Host.HostController`; see
 [host operation](host.md) for its timing, ownership and supported profile.
+
+## Endpoint-halt recovery
+
+`IHostController.ClearToggle(endpoint, inputDirection)` resets the host data toggle.
+Call it only while Idle, after a successful CLEAR_FEATURE(ENDPOINT_HALT) request.
+This allows class transports to synchronize host data toggles without depending
+on a concrete controller implementation. Custom IHostController implementations
+must implement this method.

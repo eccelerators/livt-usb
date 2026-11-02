@@ -57,19 +57,21 @@ component ConfigurationDescriptorParser<LIMIT: int = 512,
 	 */
 	public fn Reset()
 	{
-		offset = 0;
-		length = 0;
-		consumed = 0;
-		total = 0;
-		invalid = false
-		interfaces = 0;
-		endpoints = 0;
-		configuration = 0;
-		declaredInterfaces = 0
-		currentInterface = 255;
-		alternateZero = false;
-		expectedEndpoints = 0;
-		seenEndpoints = 0
+		state {
+			offset = 0;
+			length = 0;
+			consumed = 0;
+			total = 0;
+			invalid = false
+			interfaces = 0;
+			endpoints = 0;
+			configuration = 0;
+			declaredInterfaces = 0
+			currentInterface = 255;
+			alternateZero = false;
+			expectedEndpoints = 0;
+			seenEndpoints = 0
+		}
 	}
 
 	/**

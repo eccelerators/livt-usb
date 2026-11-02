@@ -14,7 +14,8 @@ using Livt.Usb.Packets
 component HostController<CAPACITY: int = 512, STYLE: MemoryStyle = MemoryStyle.Block,
 	B: IRam<byte> & new() = SequentialRam<byte, CAPACITY, STYLE>,
 	PORT_DEBOUNCE_US: int = 100000, PORT_RESET_US: int = 12000, PORT_RECOVERY_US: int = 10000,
-	P: IRam<logic[16]> & new() = SequentialRam<logic[16], 32, STYLE>> : IHostController
+	P: IRam<logic[16]> & new() = SequentialRam<logic[16], 32, STYLE>,
+	PACKET_STORAGE: ISynchronousRam<byte, uint, RamGeometry<64>> & new() = SynchronousRam<byte, uint, 64, STYLE>> : IHostController
 {
 	static assert CAPACITY >= 8 && CAPACITY <= 65535, "Transfer capacity must be 8..65535"
 
@@ -24,7 +25,7 @@ component HostController<CAPACITY: int = 512, STYLE: MemoryStyle = MemoryStyle.B
 	// Owned link, transaction engine, validation and independent staging/input RAM.
 	phy: Usb2Phy
 	port: RootPort<PORT_DEBOUNCE_US, PORT_RESET_US, PORT_RECOVERY_US>
-	engine: TransactionEngine
+	engine: TransactionEngine<STYLE, PACKET_STORAGE>
 	profile: HostProfile<CAPACITY>
 	output: B
 	input: B
@@ -88,7 +89,7 @@ component HostController<CAPACITY: int = 512, STYLE: MemoryStyle = MemoryStyle.B
 	{
 		phy = new Usb2Phy(dp, dm)
 		port = new RootPort<PORT_DEBOUNCE_US, PORT_RESET_US, PORT_RECOVERY_US>()
-		engine = new TransactionEngine()
+		engine = new TransactionEngine<STYLE, PACKET_STORAGE>()
 		profile = new HostProfile<CAPACITY>()
 		output = new B()
 		input = new B()
@@ -433,7 +434,7 @@ component HostController<CAPACITY: int = 512, STYLE: MemoryStyle = MemoryStyle.B
 	 * Resets one data toggle after a successful CLEAR_FEATURE(ENDPOINT_HALT).
 	 * The single owner calls only while idle; configuration/reset clears all entries.
 	 */
-	public fn ClearToggle(endpoint: int, inputDirection: bool) bool
+	override fn ClearToggle(endpoint: int, inputDirection: bool) bool
 	{
 		if (owned || endpoint < 1 || endpoint > 15) { return false }
 

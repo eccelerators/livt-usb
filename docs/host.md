@@ -53,6 +53,8 @@ stores and eight setup registers. Counts use capacity-derived widths. The defaul
 the event queue likewise serializes its RAM operations in its own arbiter. The `STYLE` and `IRam<byte>` backend parameters
 allow alternative storage, including `ArrayRam`. Packet slots use synchronous
 64-byte RAM; `TransactionEngine` exposes its synchronous backend parameter.
+`HostController` forwards that choice through its `PACKET_STORAGE` generic,
+and its default follows `STYLE`. See [storage selection](storage.md#selecting-nested-storage).
 The 32 endpoint/direction polling timestamps use a separate 16-bit BRAM table,
 selectable through `P: IRam<logic[16]>`. A validity mask prevents reading unwritten
 RAM after reset. Event queues also expose capacity, style and backend parameters.
@@ -89,8 +91,8 @@ descriptors, rather than fixed keyboard assumptions.
 
 A discovery or class initialization failure waits for disconnect/reset. High speed,
 hubs, isochronous endpoints, alternate-setting selection and arbitrary report
-protocol parsing are not supported. A mass-storage class driver is not implemented;
-full-speed bulk provides its underlying host transport capability.
+protocol parsing are not supported. Full-speed bulk transport also supports the
+[read-only mass-storage driver](mass-storage.md).
 
 ## Keyboard reports and events
 

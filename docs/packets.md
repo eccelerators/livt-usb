@@ -102,10 +102,9 @@ packet: the transaction layer decides whether to acknowledge/discard its payload
 
 ## Integration notes
 
-For compatibility with the current compiler, wire child inputs through a
-combinational process and assign packet lengths explicitly on each execution.
-Repeated literal local initializers can retain state. TX byte and valid are
-published together from one owner register boundary.
+Wire child inputs through a combinational process and assign packet lengths for
+each transaction. Publish TX byte and valid together from one owner register
+boundary.
 
 Protocol reference: USB 2.0 specification sections 8.3 and 8.4, with turnaround
 constraints from chapter 7: https://www.usb.org/document-library/usb-20-specification

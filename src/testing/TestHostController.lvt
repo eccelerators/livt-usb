@@ -364,4 +364,10 @@ component TestHostController<MODEL_TRANSFER_BYTES: int = 512, STYLE: MemoryStyle
 		this.actualLength = actualLength
 		transferState = TransferState.Complete
 	}
+
+	/** Accepts idle toggle resets; this transfer-level model does not simulate PIDs. */
+	override fn ClearToggle(endpoint: int, inputDirection: bool) bool
+	{
+		return transferState == TransferState.Idle && endpoint >= 1 && endpoint <= 15
+	}
 }

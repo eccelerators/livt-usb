@@ -1,0 +1,107 @@
+namespace Livt.Usb.Tests
+
+using Livt.Usb.MassStorage
+
+/** Exercises real BOT serialization, retained data and bounded fault recovery. */
+@Test
+component BulkOnlyTransportTest
+{
+	model: BulkOnlyControllerModel
+	transport: BulkOnlyTransport
+	armCancel: bool
+
+	new()
+	{
+		model = new BulkOnlyControllerModel()
+		transport = new BulkOnlyTransport(model)
+		transport.Configure(64, 2, 1, 64, 2, 64)
+	}
+
+	process Cancellation[]()
+	{
+		transport.cancel = armCancel && model.waiting
+	}
+
+	@Test
+	fn ReadsAndRetainsSector()
+	{
+		model.Reset(0)
+		assert transport.Execute(40, 0x12345678, 512) == BulkOnlyResult.Passed
+		assert model.observedLba == 0x12345678
+		assert transport.GetLength() == 512
+		var value: byte
+
+		for (var index = 0; index < 512; index++) {
+			assert transport.TryReadByte(index, value)
+			assert value == (((index & 255) ^ 165) as byte)
+		}
+
+		assert transport.TryReadByte(0, value) && value == 165
+		assert !transport.TryReadByte(512, value) && value == 0
+	}
+
+	@Test
+	fn RejectsInvalidStatusAndRecovers()
+	{
+		for (var fault: byte = 1; fault <= 4; fault++) {
+			model.Reset(fault)
+			assert transport.Execute(40, 0, 512) == BulkOnlyResult.TransportError
+			assert model.resetCount == 1 && model.clearCount == 2 && model.toggleCount == 2
+			assert transport.GetLength() == 0
+		}
+	}
+
+	@Test
+	fn HandlesCommandFailureStallsTimeoutAndUnplug()
+	{
+		model.Reset(5)
+		assert transport.Execute(40, 0, 512) == BulkOnlyResult.CommandFailed
+		assert model.resetCount == 0 && transport.GetLength() == 0
+		model.Reset(6)
+		assert transport.Execute(40, 0, 512) == BulkOnlyResult.Passed
+		assert model.resetCount == 0 && model.clearCount == 1 && model.toggleCount == 1
+		model.Reset(7)
+		assert transport.Execute(40, 0, 512) == BulkOnlyResult.CommandFailed
+		assert model.clearCount == 1 && model.toggleCount == 1
+		model.Reset(8)
+		assert transport.Execute(40, 0, 512) == BulkOnlyResult.TransportError
+		assert model.resetCount == 1
+		model.Reset(9)
+		assert transport.Execute(40, 0, 512) == BulkOnlyResult.Disconnected
+		assert model.resetCount == 0
+	}
+
+	@Test
+	fn RejectsWritesAndInvalidGeometryAndFailedRecovery()
+	{
+		model.Reset(0)
+		assert transport.Execute(42, 0, 512) == BulkOnlyResult.TransportError
+		assert transport.Execute(40, 0, 64) == BulkOnlyResult.TransportError
+		assert model.resetCount == 0 && transport.GetLength() == 0
+		model.Reset(10)
+		assert transport.Execute(40, 0, 512) == BulkOnlyResult.RecoveryFailed
+		assert model.resetCount == 1 && model.clearCount == 0
+		assert transport.GetLength() == 0
+	}
+
+	@Test
+	fn CancelsActiveTransfersAndBoundsStatusRetry()
+	{
+		model.Reset(11)
+		armCancel = true
+		assert transport.Execute(40, 0, 512) == BulkOnlyResult.Cancelled
+		assert model.resetCount == 1 && model.clearCount == 2 && model.toggleCount == 2
+		assert transport.GetLength() == 0
+		armCancel = false
+		model.Reset(12)
+		assert transport.Execute(40, 0, 512) == BulkOnlyResult.TransportError
+		assert model.resetCount == 1 && model.clearCount == 3
+		model.Reset(13)
+		assert transport.Execute(40, 0, 512) == BulkOnlyResult.TransportError
+		model.Reset(15)
+		assert transport.Execute(40, 0, 512) == BulkOnlyResult.TransportError
+		model.Reset(16)
+		assert transport.Execute(40, 0, 512) == BulkOnlyResult.Passed
+		assert transport.GetLength() == 256
+	}
+}

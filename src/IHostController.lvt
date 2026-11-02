@@ -105,4 +105,9 @@ interface IHostController
 	 * Releases Complete state and all staged data; false leaves other states unchanged.
 	 */
 	fn TryRelease() bool
+	/**
+	 * Resets an endpoint data toggle after successful CLEAR_FEATURE(ENDPOINT_HALT).
+	 * The serialized client calls only while Idle. Returns false if unavailable.
+	 */
+	fn ClearToggle(endpoint: int, inputDirection: bool) bool
 }

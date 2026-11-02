@@ -1,16 +1,16 @@
 [project]
 name = "Livt.Usb"
-version = "0.0.2"
+version = "0.0.3"
 path = "src"
 outdir = "out"
 
 [dependencies]
 "Livt.Utils" = "1.1.0"
-"Livt.IO" = "1.6.0"
+"Livt.IO" = "1.7.0"
 
 [tests]
 path = "tests"
-components = ["PacketBufferTest", "PacketBufferConfigurationTest", "HostControllerTest", "ControllerDispatchTest", "Usb2PhyTest", "PacketCodecTest", "PacketReceiverTest", "DescriptorKeyboardTest", "RootPortTiming48Test", "RootPortTiming96Test", "RootPortTiming144Test"]
+components = ["DescriptorStorageTest", "BulkOnlyTransportTest", "MassStorageHostTest", "PacketBufferTest", "PacketBufferConfigurationTest", "HostControllerTest", "ControllerDispatchTest", "Usb2PhyTest", "PacketCodecTest", "PacketReceiverTest", "DescriptorKeyboardTest", "RootPortTiming48Test", "RootPortTiming96Test", "RootPortTiming144Test"]
 
 [build.debug]
 warnings = ["all"]

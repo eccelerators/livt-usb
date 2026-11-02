@@ -53,7 +53,7 @@ Scheduled storage can vary in latency. Wire-rate paths require a suitable
 signal-level backend/adapter and their own timing tests. Do not assume the
 scheduled `IRam` API has one-edge read latency.
 
-## Host and keyboard storage
+## Host and class-driver storage
 
 | Component | Default storage |
 |---|---|
@@ -62,6 +62,7 @@ scheduled `IRam` API has one-edge read latency.
 | `ConfigurationDescriptorParser` | 32-byte metadata table using `SequentialRam` |
 | `BootKeyboardReportParser` | Two eight-byte report snapshots in a 16-byte `SequentialRam` |
 | `KeyboardEventQueue` | 32 entries of `logic[18]` using `SequentialRam` |
+| `BulkOnlyTransport` / `MassStorageHost` | One retained 512-byte block using `SequentialRam`, separate from controller storage |
 | `PacketReceiver` / `PacketTransmitter` | 64-byte synchronous packet stores |
 
 The scheduled owners serialize backend operations. The event queue arbitrates its
@@ -73,3 +74,33 @@ for the host's separate payload and polling-storage parameters.
 Packet engines require `ISynchronousRam` with the documented accepting edge and
 read-response latency. Scheduled `IRam` implementations cannot be substituted
 at that signal-level boundary. See [packet storage contracts](packets.md#clock-and-storage-contracts).
+
+## Selecting nested storage
+
+The host owners forward their endpoint-table provider instead of fixing it inside
+the enumerator:
+
+| Owner | Generic provider | Required capacity |
+|---|---|---|
+| `DeviceEnumerator<LIMIT, ENDPOINT_STORAGE>` | `IRam<byte>` | 32 bytes |
+| `BootKeyboardHost<ENDPOINT_STORAGE>` | `IRam<byte>` | 32 bytes |
+| `MassStorageHost<B, ENDPOINT_STORAGE>` | `IRam<byte>` for each provider | 512 bytes for `B`; 32 for endpoints |
+
+Each defaults to `SequentialRam` with `MemoryStyle.Block`. For example,
+`BootKeyboardHost<ArrayRam<byte, 32>>` selects a register-array endpoint table.
+`MassStorageHost<ArrayRam<byte, 512>, ArrayRam<byte, 32>>` selects arrays for both
+retained block data and endpoint metadata. The providers have parameterless
+constructors and are owned exclusively by their components. Scheduled operations
+wait for completion, so compatible providers may trade resources for extra cycles.
+
+`HostController` additionally forwards its final `PACKET_STORAGE` generic to
+`TransactionEngine`. Its default is `SynchronousRam<byte, uint, 64, STYLE>`;
+`STYLE` therefore reaches both scheduled transfer storage and wire-packet memory.
+A custom packet provider must implement
+`ISynchronousRam<byte, uint, RamGeometry<64>>` and preserve its accepting edge and
+read-response timing. This signal-level contract does not allow arbitrary extra
+read cycles. Each packet owner constructs its own provider instance.
+
+Small descriptor headers and control fields remain register arrays. Moving tiny
+buffers to scheduled RAM can cost more control logic than it saves in data storage;
+choose implementations from measured synthesis and timing results.

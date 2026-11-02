@@ -1,0 +1,378 @@
+namespace Livt.Usb.MassStorage
+
+using Livt.IO
+using Livt.Usb
+using Livt.Usb.Host
+
+/** Command result after status validation and, when needed, reset recovery. */
+enum BulkOnlyResult
+{
+	Passed
+	CommandFailed
+	TransportError
+	RecoveryFailed
+	Disconnected
+	Cancelled
+}
+
+/**
+ * Serialized read-only BOT command/data/status transactions for LUN zero.
+ * Owns retained input RAM because the controller reuses its buffer for the CSW.
+ * Configure after enumeration. Only the caller of Execute owns controller traffic.
+ * Full-speed bulk transfers aggregate packets; no writes or arbitrary CDBs exist.
+ */
+component BulkOnlyTransport<B: IRam<byte> & new() = SequentialRam<byte, 512, MemoryStyle.Block>>
+{
+	// Borrowed controller and owned control helper/data buffer.
+	controller: IHostController
+	control: ControlTransfer
+	data: B
+	ep0: byte
+	interfaceNumber: byte
+	inputEndpoint: byte
+	outputEndpoint: byte
+	inputPacket: byte
+	outputPacket: byte
+	tag: uint
+	actual: logic[10]
+	valid: bool
+
+	// Cancellation is supplied by the single command owner while Execute is running.
+	public cancel: in bool
+	public recoveries: out uint
+	public lastStatus: out byte
+
+	/** Binds an idle controller and a data store of at least 512 bytes. */
+	new(controller: IHostController)
+	{
+		this.controller = controller
+		control = new ControlTransfer(controller)
+		data = new B()
+	}
+
+	/** Stores a validated interface's geometry; endpoint numbers exclude direction bit. */
+	public fn Configure(ep0: byte, interfaceNumber: byte, inputEndpoint: byte,
+		inputPacket: byte, outputEndpoint: byte, outputPacket: byte)
+	{
+		assert data.IsValidAddress(511)
+		state {
+			this.ep0 = ep0
+			this.interfaceNumber = interfaceNumber
+			this.inputEndpoint = inputEndpoint
+			this.inputPacket = inputPacket
+			this.outputEndpoint = outputEndpoint
+			this.outputPacket = outputPacket
+			valid = false
+		}
+	}
+
+	/**
+	 * Probes the configured BOT interface before using LUN zero. A stalled
+	 * GET_MAX_LUN means a single LUN; a successful response must contain one byte.
+	 * Shares the control helper with reset recovery; call only while idle.
+	 */
+	public fn InitializeLun() bool
+	{
+		var completed = control.Run(1, ep0 as int, 161, 254, 0, interfaceNumber as int, 1)
+		var supported = controller.GetResult() == TransferResult.Stall
+
+		if (completed && controller.GetActualLength() == 1) {
+			var maximum: byte
+			controller.TryReadInput(0, maximum)
+			supported = maximum <= 15
+		}
+
+		controller.TryRelease()
+		return supported
+	}
+
+	/** Clears one device halt and the corresponding host toggle, in that order. */
+	fn ClearHalt(inputDirection: bool) bool
+	{
+		var endpoint: int
+		endpoint = outputEndpoint as int
+
+		if (inputDirection) {
+			endpoint = (inputEndpoint as int) | 128
+		}
+
+		var cleared = control.Run(1, ep0 as int, 2, 1, 0, endpoint, 0)
+		controller.TryRelease()
+
+		if (!cleared) {
+			return false
+		}
+
+		return controller.ClearToggle(endpoint & 15, inputDirection)
+	}
+
+	/** Performs the mandatory class reset, clear bulk IN, clear bulk OUT sequence. */
+	public fn Recover() bool
+	{
+		valid = false
+		controller.TryRelease()
+
+		if (!controller.IsConnected()) {
+			return false
+		}
+
+		recoveries++
+		var resetSucceeded = control.Run(1, ep0 as int, 33, 255, 0, interfaceNumber as int, 0)
+		controller.TryRelease()
+
+		if (!resetSucceeded || !ClearHalt(true)) {
+			return false
+		}
+
+		return ClearHalt(false)
+	}
+
+	/** Runs one bounded transfer; its completion remains retained for inspection. */
+	fn Transfer(inputDirection: bool, length: int) TransferResult
+	{
+		var endpoint: int
+		var packet: int
+		var direction: TransferDirection
+		state {
+			endpoint = outputEndpoint as int
+			packet = outputPacket as int
+			direction = TransferDirection.HostToDevice
+		}
+
+		if (inputDirection) {
+			state {
+				endpoint = inputEndpoint as int
+				packet = inputPacket as int
+				direction = TransferDirection.DeviceToHost
+			}
+		}
+
+		if (controller.TrySubmit(1, endpoint, TransferKind.Bulk, direction,
+			packet, length, 2000, 0) != SubmissionResult.Accepted) {
+			return TransferResult.ProtocolError
+		}
+
+		while (controller.GetState() == TransferState.Active) {
+			if (cancel) {
+				controller.Cancel()
+			}
+		}
+
+		return controller.GetResult()
+	}
+
+	/** Reads one retained controller byte using a local out parameter. */
+	fn InputByte(index: int) byte
+	{
+		var value: byte
+		controller.TryReadInput(index, value)
+		return value
+	}
+
+	/** Reads a little-endian CSW field without exposing controller storage. */
+	fn InputWord(offset: int) uint
+	{
+		var value: uint
+		value = 0
+
+		for (var index: byte = 0; index < 4; index++) {
+			value = value | ((InputByte(offset + (index as int)) as uint) << ((index as int) * 8))
+		}
+
+		return value
+	}
+
+	/** Builds CBW bytes, padding the CDB to sixteen bytes with zeros. */
+	fn CommandByte[](index: byte, opcode: byte, lba: uint, commandLength: byte, length: int) byte
+	{
+		if (index < 4) {
+			if (index == 0) {
+				return 85
+			}
+
+			if (index == 1) {
+				return 83
+			}
+
+			if (index == 2) {
+				return 66
+			}
+
+			return 67
+		}
+
+		if (index < 8) {
+			return ((tag >> (((index as int) - 4) * 8)) & 255) as byte
+		}
+
+		if (index < 12) {
+			return (((length as uint) >> (((index as int) - 8) * 8)) & 255) as byte
+		}
+
+		if (index == 12) {
+			if (length == 0) {
+				return 0
+			}
+
+			return 128
+		}
+
+		if (index == 13) {
+			return 0
+		}
+
+		if (index == 14) {
+			return commandLength
+		}
+
+		return ReadOnlyScsiCommand.GetByte(opcode, lba, ((index as int) - 15) as byte)
+	}
+
+	/** Invalidates data, recovers transport synchronization, and reports failure. */
+	fn Fail() BulkOnlyResult
+	{
+		valid = false
+		controller.TryRelease()
+
+		if (!controller.IsConnected()) {
+			return BulkOnlyResult.Disconnected
+		}
+
+		if (!Recover()) {
+			return BulkOnlyResult.RecoveryFailed
+		}
+
+		if (cancel) {
+			return BulkOnlyResult.Cancelled
+		}
+
+		return BulkOnlyResult.TransportError
+	}
+
+	/**
+	 * Executes a permitted read-only command. Result/data are valid only after return.
+	 * Each phase has a 2s transfer deadline; CSW stall retries once. Transport errors
+	 * perform one reset recovery. CommandFailed requires REQUEST SENSE at class level.
+	 */
+	public fn Execute(opcode: byte, lba: uint, length: int) BulkOnlyResult
+	{
+		state {
+			valid = false
+			actual = 0
+			lastStatus = 255
+		}
+		var commandLength = ReadOnlyScsiCommand.Length(opcode)
+
+		if (cancel) {
+			return BulkOnlyResult.Cancelled
+		}
+
+		if (commandLength == 0 || length != ReadOnlyScsiCommand.DataLength(opcode)) {
+			return BulkOnlyResult.TransportError
+		}
+
+		tag++
+		controller.TryClearStaging()
+
+		for (var index: byte = 0; index < 31; index++) {
+			if (!controller.TryStageOutput(CommandByte(index, opcode, lba, commandLength, length))) {
+				return Fail()
+			}
+		}
+
+		if (Transfer(false, 31) != TransferResult.Success) {
+			return Fail()
+		}
+
+		controller.TryRelease()
+
+		if (length > 0) {
+			var dataResult = Transfer(true, length)
+			var received = controller.GetActualLength()
+
+			if (received < 0 || received > length) {
+				return Fail()
+			}
+
+			actual = received as logic[10]
+
+			for (var index: logic[10] = 0; (index as uint) < (actual as uint); index++) {
+				data.Write((index as uint) as int, InputByte((index as uint) as int))
+			}
+
+			controller.TryRelease()
+
+			if (dataResult == TransferResult.Stall) {
+				if (!ClearHalt(true)) {
+					return Fail()
+				}
+			} elif (dataResult != TransferResult.Success) {
+				return Fail()
+			}
+		}
+
+		var statusResult = Transfer(true, 13)
+
+		if (statusResult == TransferResult.Stall) {
+			controller.TryRelease()
+
+			if (!ClearHalt(true)) {
+				return Fail()
+			}
+
+			statusResult = Transfer(true, 13)
+		}
+
+		if (statusResult != TransferResult.Success || controller.GetActualLength() != 13) {
+			return Fail()
+		}
+
+		if (InputWord(0) != (0x53425355 as uint)) {
+			return Fail()
+		}
+
+		if (InputWord(4) != tag) {
+			return Fail()
+		}
+		var residue = InputWord(8)
+		var status = InputByte(12)
+		lastStatus = status
+		controller.TryRelease()
+
+		if (status > 1
+			|| residue > (length as uint) || (length as uint) - residue > (actual as uint)) {
+			return Fail()
+		}
+
+		if (status == 1) {
+			return BulkOnlyResult.CommandFailed
+		}
+
+		actual = (length - (residue as int)) as logic[10]
+		valid = true
+		return BulkOnlyResult.Passed
+	}
+
+	/** Returns relevant bytes only after a successful command status. */
+	public fn GetLength() int
+	{
+		if (!valid) {
+			return 0
+		}
+
+		return (actual as uint) as int
+	}
+
+	/** Non-consuming read of retained command data; the next Execute invalidates it. */
+	public fn TryReadByte(index: int, value: out byte) bool
+	{
+		value = 0
+
+		if (!valid || index < 0 || index >= ((actual as uint) as int)) {
+			return false
+		}
+
+		value = data.Read(index)
+		return true
+	}
+}

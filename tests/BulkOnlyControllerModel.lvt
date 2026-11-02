@@ -1,0 +1,393 @@
+namespace Livt.Usb.Tests
+
+using Livt.Usb
+
+/** Independent transfer-level BOT device with deterministic sector bytes and faults. */
+component BulkOnlyControllerModel : IHostController
+{
+	setup: byte[8]
+	output: byte[31]
+	setupCount: int
+	outputCount: int
+	transferState: TransferState
+	result: TransferResult
+	actual: int
+	response: byte
+	phase: byte
+	tag: uint
+	expected: uint
+	connected: bool
+	stalled: bool
+	public waiting: out bool
+	public fault: byte
+	public resetCount: int
+	public clearCount: int
+	public toggleCount: int
+	public observedLba: uint
+	hostMode: bool
+	opcode: byte
+	readyAttempts: byte
+	const DEVICE: byte[18] = [18, 1, 0, 2, 0, 0, 0, 64, 52, 18, 120, 86, 0, 1, 0, 0, 0, 1]
+	const CONFIGURATION: byte[32] = [9, 2, 32, 0, 1, 1, 0, 128, 50, 9, 4, 0, 0, 2, 8, 6, 80, 0, 7, 5, 129, 2, 64, 0, 0, 7, 5, 2, 2, 64, 0, 0]
+
+	/** Chooses transport-only or full enumeration behavior at construction. */
+	new(hostMode: bool = false)
+	{
+		this.hostMode = hostMode
+	}
+
+	/** Establishes a fresh fixture and chosen fault without resetting the host tag. */
+	public fn Reset(fault: byte)
+	{
+		waiting = false
+		this.fault = fault
+		transferState = TransferState.Idle
+		phase = 0
+		setupCount = 0
+		outputCount = 0
+		connected = true
+		stalled = false
+		resetCount = 0
+		clearCount = 0
+		toggleCount = 0
+		readyAttempts = 0
+	}
+
+	/** Advertises the fixture's full-speed control and bulk profile. */
+	override fn Supports(speed: UsbSpeed, kind: TransferKind) bool
+	{
+		return speed == UsbSpeed.Full
+	}
+
+	override fn GetDeviceCapacity() int
+	{
+		return 1
+	}
+
+	override fn GetInterfaceCapacity() int
+	{
+		return 4
+	}
+
+	override fn GetEndpointCapacity() int
+	{
+		return 4
+	}
+
+	override fn GetTransferCapacity() int
+	{
+		return 512
+	}
+
+	override fn IsConnected() bool
+	{
+		return connected
+	}
+
+	override fn GetSpeed() UsbSpeed
+	{
+		return UsbSpeed.Full
+	}
+
+	override fn GetState() TransferState
+	{
+		return transferState
+	}
+
+	override fn GetResult() TransferResult
+	{
+		return result
+	}
+
+	override fn GetActualLength() int
+	{
+		return actual
+	}
+
+	override fn TryClearStaging() bool
+	{
+		if (transferState != TransferState.Idle) { return false }
+
+		setupCount = 0
+		outputCount = 0
+		return true
+	}
+
+	override fn TryStageSetup(value: byte) bool
+	{
+		if (setupCount >= 8) { return false }
+
+		setup[setupCount] = value
+		setupCount++
+		return true
+	}
+
+	override fn TryStageOutput(value: byte) bool
+	{
+		if (outputCount >= 31) { return false }
+
+		output[outputCount] = value
+		outputCount++
+		return true
+	}
+
+	override fn TryRelease() bool
+	{
+		if (transferState != TransferState.Complete) { return false }
+
+		transferState = TransferState.Idle
+		setupCount = 0
+		outputCount = 0
+		return true
+	}
+
+	override fn Cancel() bool
+	{
+		if (transferState != TransferState.Active) { return false }
+
+		actual = 0
+		result = TransferResult.Cancelled
+		transferState = TransferState.Complete
+		return true
+	}
+
+	override fn ClearToggle(endpoint: int, inputDirection: bool) bool
+	{
+		assert transferState == TransferState.Idle
+		toggleCount++
+		return true
+	}
+
+	/** Checks CBW wire fields independently and produces a selected data/status fault. */
+	override fn TrySubmit(address: int, endpoint: int, kind: TransferKind,
+		direction: TransferDirection, maxPacketSize: int, length: int,
+		timeoutFrames: int, intervalFrames: int) SubmissionResult
+	{
+		assert transferState == TransferState.Idle
+		result = TransferResult.Success
+		actual = length
+		transferState = TransferState.Complete
+
+		if (kind == TransferKind.Control) {
+			assert setupCount == 8
+
+			if (hostMode && setup[1] == 6) {
+				response = 3
+
+				if (setup[3] == 2) { response = 4 }
+
+				return SubmissionResult.Accepted
+			}
+
+			if (hostMode && (setup[1] == 5 || setup[1] == 9)) { return SubmissionResult.Accepted }
+
+			if (hostMode && setup[1] == 254) {
+				response = 5
+
+				if (fault == 17) {
+					result = TransferResult.Stall;
+					actual = 0
+				}
+
+				return SubmissionResult.Accepted
+			}
+
+			if (setup[1] == 255) {
+				assert setup[0] == 33
+				if (hostMode) { assert setup[4] == 0 } else { assert setup[4] == 2 }
+				resetCount++
+
+				if (fault == 10) { result = TransferResult.Stall }
+
+				phase = 0
+			} else {
+				assert setup[0] == 2 && setup[1] == 1
+				assert setup[4] == 129 || setup[4] == 2
+				clearCount++
+			}
+
+			return SubmissionResult.Accepted
+		}
+
+		assert kind == TransferKind.Bulk && address == 1 && maxPacketSize == 64
+
+		if (direction == TransferDirection.HostToDevice) {
+			assert endpoint == 2 && length == 31 && outputCount == 31
+			assert output[0] == 85 && output[1] == 83 && output[2] == 66 && output[3] == 67
+			assert output[13] == 0
+			tag = 0
+			expected = 0
+			observedLba = 0
+
+			for (var index: byte = 0; index < 4; index++) {
+				tag = tag | ((output[4 + (index as int)] as uint) << ((index as int) * 8))
+				expected = expected | ((output[8 + (index as int)] as uint) << ((index as int) * 8))
+				observedLba = (observedLba << 8) | (output[17 + (index as int)] as uint)
+			}
+
+			if (expected == 0) { assert output[12] == 0 } else { assert output[12] == 128 }
+
+			opcode = output[15]
+
+			if (opcode == 0) {
+				readyAttempts++
+			}
+
+			if (opcode == 0) { assert output[14] == 6 && expected == 0 }
+
+			if (opcode == 3) { assert output[14] == 6 && output[19] == 18 && expected == 18 }
+
+			if (opcode == 18) { assert output[14] == 6 && output[19] == 36 && expected == 36 }
+
+			if (opcode == 37) { assert output[14] == 10 && expected == 8 }
+
+			for (var index: byte = 25; index < 31; index++) { assert output[index as int] == 0 }
+
+			if (!hostMode || opcode == 40) {
+				assert output[14] == 10 && output[15] == 40 && output[22] == 0 && output[23] == 1
+				assert expected == 512
+			}
+
+			phase = 1
+
+			if (expected == 0) { phase = 2 }
+
+			return SubmissionResult.Accepted
+		}
+
+		assert endpoint == 1
+		response = phase
+
+		if (phase == 1) {
+			assert (length as uint) == expected
+			phase = 2
+
+			if (fault == 11) {
+				actual = 0;
+				transferState = TransferState.Active;
+				waiting = true
+			}
+
+			if (fault == 15 || fault == 16) { actual = 256 }
+
+			if (fault == 7) {
+				result = TransferResult.Stall;
+				actual = 0
+			}
+
+			if (fault == 8) {
+				result = TransferResult.Timeout;
+				actual = 0
+			}
+
+			if (fault == 9) {
+				connected = false;
+				result = TransferResult.Disconnected;
+				actual = 0
+			}
+		} else {
+			assert phase == 2 && length == 13
+
+			if (fault == 13) { actual = 12 }
+
+			if ((fault == 6 && !stalled) || fault == 12) {
+				result = TransferResult.Stall
+				actual = 0
+				stalled = true
+			} else { phase = 0 }
+		}
+
+		return SubmissionResult.Accepted
+	}
+
+	/** Supplies pattern data or CSW bytes; no production encoder/parser is reused. */
+	override fn TryReadInput(index: int, value: out byte) bool
+	{
+		value = 0
+
+		if (transferState != TransferState.Complete || index < 0 || index >= actual) { return false }
+
+		if (response == 3) {
+			value = DEVICE[index];
+			return true
+		}
+
+		if (response == 4) {
+			value = CONFIGURATION[index];
+			return true
+		}
+
+		if (response == 5) { return true }
+
+		if (response == 1) {
+			if (opcode == 3) {
+				if (index == 0) { value = 112 }
+
+				if (index == 2) { value = 2 }
+
+				if (index == 7) { value = 10 }
+
+				if (index == 12) { value = 58 }
+
+				return true
+			}
+
+			if (opcode == 18) {
+				if (index == 4) { value = 31 }
+
+				return true
+			}
+
+			if (opcode == 37) {
+				if (index == 3) { value = 15 }
+
+				if (index == 6) {
+					value = 2;
+
+					if (fault == 14) { value = 4 }
+				}
+
+				return true
+			}
+
+			value = ((index & 255) ^ 165) as byte
+			if (hostMode) { value = value ^ (observedLba as byte) }
+			return true
+		}
+
+		var signature: uint
+		var echoedTag: uint
+		var residue: uint
+		signature = 0x53425355
+		echoedTag = tag
+		residue = 0
+
+		if (fault == 1 || fault == 10) { signature = 0 }
+
+		if (fault == 2) { echoedTag = tag + 1 }
+
+		if (fault == 3) { residue = 513 }
+
+		if (fault == 7) { residue = 512 }
+
+		if (fault == 16) { residue = 256 }
+
+		if (index < 4) { value = ((signature >> (index * 8)) & 255) as byte } elif (index < 8) { value = ((echoedTag >> ((index - 4) * 8)) & 255) as byte } elif (index < 12) { value = ((residue >> ((index - 8) * 8)) & 255) as byte } else {
+			if (fault == 4) { value = 2 }
+
+			if (fault == 5 || fault == 7) { value = 1 }
+
+			if (fault == 18 && opcode == 0 && readyAttempts == 1) {
+				value = 1
+			}
+		}
+
+		return true
+	}
+
+	/** Removes the model device without resetting the class worker. */
+	public fn Disconnect()
+	{
+		connected = false
+	}
+}

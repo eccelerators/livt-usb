@@ -1,5 +1,6 @@
 namespace Livt.Usb.Host
 
+using Livt.IO
 using Livt.Usb
 using Livt.Usb.Descriptors
 
@@ -8,7 +9,8 @@ using Livt.Usb.Descriptors
  * One scheduled owner calls Enumerate and then owns the controller for class traffic.
  * Keeps standard descriptor discovery independent of class-specific initialization.
  */
-component DeviceEnumerator<LIMIT: int = 512>
+component DeviceEnumerator<LIMIT: int = 512,
+	ENDPOINT_STORAGE: IRam<byte> & new() = SequentialRam<byte, 32, MemoryStyle.Block>>
 {
 	// Round two milliseconds up to whole ticks, including non-integral-MHz contexts.
 	const ADDRESS_RECOVERY_TICKS: uint = (this.context.TicksPer(1Hz) - 1) / 500 + 1
@@ -21,7 +23,7 @@ component DeviceEnumerator<LIMIT: int = 512>
 	controller: IHostController
 	control: ControlTransfer
 	device: DeviceDescriptorParser
-	configuration: ConfigurationDescriptorParser<LIMIT>
+	configuration: ConfigurationDescriptorParser<LIMIT, ENDPOINT_STORAGE>
 	packetSize: byte
 	configured: bool
 	phase: byte
@@ -39,7 +41,7 @@ component DeviceEnumerator<LIMIT: int = 512>
 		this.controller = controller
 		control = new ControlTransfer(controller)
 		device = new DeviceDescriptorParser()
-		configuration = new ConfigurationDescriptorParser<LIMIT>()
+		configuration = new ConfigurationDescriptorParser<LIMIT, ENDPOINT_STORAGE>()
 	}
 
 	/**

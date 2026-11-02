@@ -1,0 +1,90 @@
+namespace Livt.Usb.Tests
+
+using Livt.IO
+using Livt.Usb.MassStorage
+
+/** Real discovery/class worker against independent descriptors and SCSI responses. */
+@Test
+@Context(ClockFrequency = 10MHz)
+component MassStorageHostTest
+{
+	model: BulkOnlyControllerModel
+	host: MassStorageHost
+
+	new()
+	{
+		model = new BulkOnlyControllerModel(true)
+		host = new MassStorageHost(model)
+	}
+
+	/** Waits with a test-side watchdog for discovery to leave its active phases. */
+	fn AwaitReady()
+	{
+		var cycles: int
+		cycles = 0
+
+		while (host.status != 4 && host.status != 5 && cycles < 5000000) {
+			cycles++
+		}
+	}
+
+	@Test
+	fn EnumeratesReadsAndRejectsUnsupportedBlocks()
+	{
+		model.Reset(17)
+		AwaitReady()
+		assert host.IsReady()
+		assert host.GetBlockCount() == 16 && host.GetBlockSize() == 512
+		assert !host.TryReadBlock(16)
+		assert host.TryReadBlock(15)
+		assert !host.TryReadBlock(0)
+		var cycles: int
+		cycles = 0
+
+		while (host.GetReadState() == BlockReadState.Active && cycles < 200000) {
+			cycles++
+		}
+
+		assert host.GetReadState() == BlockReadState.Complete
+		var value: byte
+		assert host.TryReadByte(511, value) && value == 85
+		assert host.ReleaseRead()
+		assert host.GetReadState() == BlockReadState.Idle
+		// Distinct per-LBA data detects accidental reuse of the preceding completion.
+		assert host.TryReadBlock(14)
+		assert host.GetReadState() == BlockReadState.Active
+		cycles = 0
+		while (host.GetReadState() == BlockReadState.Active && cycles < 200000) { cycles++ }
+		assert host.GetReadState() == BlockReadState.Complete
+		assert host.TryReadByte(0, value) && value == 171
+		assert host.TryReadByte(511, value) && value == 84
+		assert host.ReleaseRead()
+
+		model.Disconnect()
+		cycles = 0
+
+		while (host.status != 0 && cycles < 20000) {
+			cycles++
+		}
+
+		assert host.status == 0 && !host.IsReady()
+		// A valid failed readiness command must request sense and retry, without reset recovery.
+		model.Reset(18)
+		AwaitReady()
+		assert host.IsReady() && host.sense == (0x023A00 as logic[24])
+		assert model.resetCount == 0 && host.GetBlockCount() == 16
+		model.Disconnect()
+		cycles = 0
+
+		while (host.status != 0 && cycles < 20000) {
+			cycles++
+		}
+
+		assert host.status == 0
+		model.Reset(14)
+		AwaitReady()
+		assert !host.IsReady() && host.status == 5
+		assert host.GetBlockCount() == 0
+		assert !host.TryReadBlock(0)
+	}
+}

@@ -1,0 +1,81 @@
+namespace Livt.Usb.Tests
+
+using Livt.IO
+using Livt.Usb
+using Livt.Usb.Descriptors
+
+/** The same wire fixtures exercise BRAM and register-array endpoint tables. */
+@Test
+component DescriptorStorageTest
+{
+	device: DeviceDescriptorParser
+	configuration: ConfigurationDescriptorParser
+	arrayConfiguration: ConfigurationDescriptorParser<512, ArrayRam<byte, 32>>
+	const DEVICE: byte[18] = [18, 1, 0, 2, 0, 0, 0, 64, 52, 18, 120, 86, 0, 1, 0, 0, 0, 1]
+	const CONFIGURATION: byte[32] = [9, 2, 32, 0, 1, 1, 0, 128, 50, 9, 4, 0, 0, 2, 8, 6, 80, 0, 7, 5, 129, 2, 64, 0, 0, 7, 5, 2, 2, 64, 0, 0]
+
+	new()
+	{
+		device = new DeviceDescriptorParser()
+		configuration = new ConfigurationDescriptorParser()
+		arrayConfiguration = new ConfigurationDescriptorParser<512, ArrayRam<byte, 32>>()
+	}
+
+	@Test
+	fn ParsesPrefixesAndRetainsIdentity()
+	{
+		device.Reset()
+
+		for (var index: byte = 0; index < 8; index++) {
+			device.Feed(DEVICE[index as int])
+		}
+
+		assert device.HasPacketSize(UsbSpeed.Full)
+		assert !device.HasPacketSize(UsbSpeed.Low)
+		assert !device.IsValid(UsbSpeed.Full)
+		device.Reset()
+
+		for (var index: byte = 0; index < 18; index++) {
+			device.Feed(DEVICE[index as int])
+		}
+
+		assert device.IsValid(UsbSpeed.Full)
+		assert device.GetVendor() == 0x1234
+		assert device.GetProduct() == 0x5678
+		assert device.identity == (0x12345678 as logic[32])
+		device.Feed(0)
+		assert !device.IsValid(UsbSpeed.Full)
+	}
+
+	@Test
+	fn ResetsMetadataAndRejectsDuplicateEndpoints()
+	{
+		for (var pass: byte = 0; pass < 3; pass++) {
+			configuration.Reset()
+			arrayConfiguration.Reset()
+
+			for (var index: byte = 0; index < 32; index++) {
+				var value = CONFIGURATION[index as int]
+
+				if (pass == 1 && index == 27) {
+					value = 129
+				}
+
+				configuration.Feed(value)
+				arrayConfiguration.Feed(value)
+			}
+
+			if (pass == 1) {
+				assert !configuration.IsValid(UsbSpeed.Full) && !arrayConfiguration.IsValid(UsbSpeed.Full)
+			} else {
+				assert configuration.IsValid(UsbSpeed.Full) && arrayConfiguration.IsValid(UsbSpeed.Full)
+				assert !configuration.IsValid(UsbSpeed.Low) && !arrayConfiguration.IsValid(UsbSpeed.Low)
+				assert configuration.GetEndpoint(0, 0) == 129 && arrayConfiguration.GetEndpoint(0, 0) == 129
+				assert configuration.GetEndpoint(1, 0) == 2 && arrayConfiguration.GetEndpoint(1, 0) == 2
+				assert configuration.GetEndpoint(1, 2) == 64 && arrayConfiguration.GetEndpoint(1, 2) == 64
+				assert configuration.GetEndpoint(1, 5) == 8 && arrayConfiguration.GetEndpoint(1, 5) == 8
+				assert configuration.GetEndpoint(2, 0) == -1 && arrayConfiguration.GetEndpoint(2, 0) == -1
+			}
+		}
+	}
+}

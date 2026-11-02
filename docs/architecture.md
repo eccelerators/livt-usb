@@ -1,6 +1,6 @@
 # Package architecture
 
-`Livt.Usb 0.0.2` owns portable USB signaling, packets, host services and supported
+`Livt.Usb 0.0.3` owns portable USB signaling, packets, host services and supported
 class handlers. Applications own terminal commands, keyboard layouts and data-use
 policy. Platform integration owns clock generation, reset conditioning, VBUS,
 electrical pads and timing constraints.
@@ -9,14 +9,19 @@ electrical pads and timing constraints.
 
 The application constructs protocol components and supplies physical bindings.
 Library components do not create a UART, CLI, platform clock or filesystem.
-`Livt.Usb` uses `Livt.IO 1.6.0` for storage and `Livt.Utils 1.1.0` for CRC helpers.
+`Livt.Usb` uses `Livt.IO 1.7.0` for storage and its read-only block-device contract,
+and `Livt.Utils 1.1.0` for CRC helpers. Both are published registry dependencies.
 Neither dependency needs to depend on `Livt.Usb`.
 
 `HostController` owns the PHY, root-port timing, transaction engine and retained
 transfer storage. One scheduled client owns staging, submission and result access.
 `BootKeyboardHost` borrows that client and owns enumeration, class setup, report
 parsing and its event queue. Consumers must not submit competing requests while
-that driver is active.
+that driver is active. `MassStorageHost` likewise owns that client while enumerating
+and reading a storage device. It exposes retained block reads through
+`IReadOnlyBlockDevice`; its BOT transport retains block data separately from the
+controller buffer used to receive command status. Select one class owner for the
+single attached device.
 
 ## Namespaces and layers
 
@@ -30,6 +35,7 @@ Keep namespaces shallow and introduce them with implemented contents.
 | `Livt.Usb.Host` | Root-port service, transactions, transfers and enumeration |
 | `Livt.Usb.Descriptors` | Bounded device/configuration/interface/endpoint parsing |
 | `Livt.Usb.Hid` | Boot-keyboard lifecycle, reports and usage transitions |
+| `Livt.Usb.MassStorage` | Read-only SCSI commands, BOT framing/recovery and retained blocks |
 | `Livt.Usb.Testing` | Manually driven controller substitution |
 
 USB signaling and PHY adapters belong to `Livt.Usb.IO`; general-purpose I/O stays
@@ -61,10 +67,10 @@ See [host contracts](host-controller.md), [host operation](host.md),
 
 ## Extension boundaries
 
-Mass-storage class transport is not implemented. Future USB class handlers can
-reuse host control/bulk services and standard discovery. General block-device,
-SCSI and filesystem facilities should be shared with appropriate storage libraries
-where their contracts are independent of USB.
+Additional USB class handlers can reuse host control/bulk services and standard
+discovery. The read-only block-device contract belongs to `Livt.IO`; filesystem
+and partition handling remain above it. The small read-only SCSI command encoder
+stays in `Livt.Usb.MassStorage` until another transport requires a shared API.
 
 Type-C connection management, Power Delivery, USB device role and other bus
 generations are separate concerns. A connector shape does not select a data role

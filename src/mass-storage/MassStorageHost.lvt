@@ -1,0 +1,402 @@
+namespace Livt.Usb.MassStorage
+
+using Livt.IO
+using Livt.Usb
+using Livt.Usb.Host
+
+/**
+ * Autonomous direct full-speed SCSI/BOT storage discovery and one retained block.
+ * Supports LUN zero, READ CAPACITY(10), and 512-byte sectors below 2^32 blocks.
+ * One external scheduled client accepts, reads and releases jobs. The worker owns
+ * every controller call; data is never exposed until the command status passes.
+ */
+component MassStorageHost<B: IRam<byte> & new() = SequentialRam<byte, 512, MemoryStyle.Block>,
+	ENDPOINT_STORAGE: IRam<byte> & new() = SequentialRam<byte, 32, MemoryStyle.Block>> : IReadOnlyBlockDevice
+{
+	const RETRY_TICKS: uint = (this.context.TicksPer(1Hz) - 1) / 10 + 1
+	const RETRY_BITS: int = Bits.RequiredFor(RETRY_TICKS)
+
+	// Owned discovery/transport; controller is borrowed from the composition root.
+	controller: IHostController
+	enumerator: DeviceEnumerator<512, ENDPOINT_STORAGE>
+	transport: BulkOnlyTransport<B>
+	inputEndpoint: byte
+	outputEndpoint: byte
+	inputPacket: byte
+	outputPacket: byte
+	interfaceNumber: byte
+	blocks: uint
+	online: bool
+
+	// Client-owned request mailbox and worker-owned retained completion.
+	owned: bool
+	request: bool
+	cancelRequest: bool
+	lba: uint
+	seen: bool
+	finished: bool
+	success: bool
+
+	// Read-only diagnostic signals; status 0 absent, 1 enumeration, 2 unsupported,
+	// 3 initializing, 4 ready, 5 transport/init failure. Sense is key/ASC/ASCQ.
+	public status: out byte
+	// Enumeration phases 0..6; initialization: 7 LUN, 8 inquiry, 9 readiness, 10 capacity.
+	public phase: out byte
+	public identity: out logic[32]
+	public sense: out logic[24]
+	public recoveries: out uint
+	public commandStatus: out byte
+
+	/** Starts discovery on attachment; input/output data storage defaults to BRAM. */
+	new(controller: IHostController)
+	{
+		this.controller = controller
+		enumerator = new DeviceEnumerator<512, ENDPOINT_STORAGE>(controller)
+		transport = new BulkOnlyTransport<B>(controller)
+	}
+
+	/** Wires observations and cancellation without crossing scheduled ownership. */
+	process Signals[]()
+	{
+		transport.cancel = cancelRequest
+		identity = enumerator.identity
+		recoveries = transport.recoveries
+		commandStatus = transport.lastStatus
+	}
+
+	/** Returns media readiness independently of the retained read slot. */
+	override fn IsReady() bool
+	{
+		return online
+	}
+
+	/** Returns usable block count only while the media is ready. */
+	override fn GetBlockCount() uint
+	{
+		if (!online) {
+			return 0
+		}
+
+		return blocks
+	}
+
+	/** This profile explicitly accepts only 512-byte logical sectors. */
+	override fn GetBlockSize() int
+	{
+		if (!online) {
+			return 0
+		}
+
+		return 512
+	}
+
+	/** Reserves one read and publishes the immutable request to the worker. */
+	override fn TryReadBlock(lba: uint) bool
+	{
+		if (!online || owned || lba >= blocks) {
+			return false
+		}
+
+		state {
+			this.lba = lba
+			cancelRequest = false
+			owned = true
+			request = !request
+		}
+		return true
+	}
+
+	/** Completion cannot be confused with that of a preceding mailbox generation. */
+	override fn GetReadState() BlockReadState
+	{
+		if (!owned) {
+			return BlockReadState.Idle
+		}
+
+		if (seen != request || !finished) {
+			return BlockReadState.Active
+		}
+
+		if (success && online) {
+			return BlockReadState.Complete
+		}
+
+		return BlockReadState.Failed
+	}
+
+	/** Retains data under consumer backpressure; unplug immediately invalidates it. */
+	override fn TryReadByte(index: int, value: out byte) bool
+	{
+		value = 0
+
+		if (!owned || seen != request || !finished || !success || !online) {
+			return false
+		}
+
+		return transport.TryReadByte(index, value)
+	}
+
+	/** Asks the transport worker to cancel; callers must wait for completion. */
+	override fn CancelRead() bool
+	{
+		if (!owned || (seen == request && finished)) {
+			return false
+		}
+
+		cancelRequest = true
+		return true
+	}
+
+	/** Drops a completed block only after its consumer explicitly releases it. */
+	override fn ReleaseRead() bool
+	{
+		if (!owned || seen != request || !finished) {
+			return false
+		}
+
+		state {
+			owned = false
+			cancelRequest = false
+		}
+		return true
+	}
+
+	/** Selects exactly one SCSI transparent BOT interface with paired bulk pipes. */
+	fn Bind() bool
+	{
+		state {
+			inputEndpoint = 0
+			outputEndpoint = 0
+		}
+
+		if (controller.GetSpeed() != UsbSpeed.Full) {
+			return false
+		}
+
+		for (var index: byte = 0; index < 3; index++) {
+			if (enumerator.GetEndpoint(index as int, 1) == 2
+				&& enumerator.GetEndpoint(index as int, 5) == 8
+				&& enumerator.GetEndpoint(index as int, 6) == 6
+				&& enumerator.GetEndpoint(index as int, 7) == 80) {
+				var candidate = enumerator.GetEndpoint(index as int, 4) as byte
+
+				if (inputEndpoint == 0 && outputEndpoint == 0) {
+					interfaceNumber = candidate
+				}
+
+				if (candidate == interfaceNumber) {
+					var address = enumerator.GetEndpoint(index as int, 0) as byte
+					var packet = enumerator.GetEndpoint(index as int, 2) as byte
+
+					if (address >= 128) {
+						if (inputEndpoint != 0) {
+							return false
+						}
+
+						inputEndpoint = address & 15
+						inputPacket = packet
+					} else {
+						if (outputEndpoint != 0) {
+							return false
+						}
+
+						outputEndpoint = address & 15
+						outputPacket = packet
+					}
+				}
+			}
+		}
+
+		return inputEndpoint != 0 && outputEndpoint != 0
+	}
+
+	/** Reads retained successful transport data through a local out parameter. */
+	fn DataByte(index: int) byte
+	{
+		var value: byte
+		transport.TryReadByte(index, value)
+		return value
+	}
+
+	/** Parses big-endian SCSI response fields. */
+	fn DataWord(offset: int) uint
+	{
+		var value: uint
+		value = 0
+
+		for (var index: byte = 0; index < 4; index++) {
+			value = (value << 8) | (DataByte(offset + (index as int)) as uint)
+		}
+
+		return value
+	}
+
+	/** Retains sense key/ASC/ASCQ after a failed SCSI command, never exposing its data. */
+	fn ReadSense()
+	{
+		if (transport.Execute(ReadOnlyScsiCommand.REQUEST_SENSE, 0, 18) == BulkOnlyResult.Passed
+			&& transport.GetLength() >= 14) {
+			var format = DataByte(0) & 127
+
+			if (format == 112 || format == 113) {
+				sense = (((DataByte(2) & 15) as logic[24]) << 16)
+					| ((DataByte(12) as logic[24]) << 8) | (DataByte(13) as logic[24])
+			}
+		}
+	}
+
+	/** Initializes LUN zero with bounded ready retries and strict capacity bounds. */
+	fn Initialize() bool
+	{
+		transport.Configure(enumerator.GetPacketSize() as byte, interfaceNumber,
+			inputEndpoint, inputPacket, outputEndpoint, outputPacket)
+		phase = 7
+
+		if (!transport.InitializeLun()) {
+			return false
+		}
+
+		phase = 8
+
+		if (transport.Execute(ReadOnlyScsiCommand.INQUIRY, 0, 36) != BulkOnlyResult.Passed
+			|| transport.GetLength() < 36 || DataByte(0) != 0) {
+			return false
+		}
+
+		phase = 9
+		var ready: bool
+		ready = false
+
+		for (var attempt: byte = 0; attempt < 8 && !ready; attempt++) {
+			var result = transport.Execute(ReadOnlyScsiCommand.TEST_UNIT_READY, 0, 0)
+
+			if (result == BulkOnlyResult.Passed) {
+				ready = true
+			} elif (result != BulkOnlyResult.CommandFailed) {
+				phase = 11
+
+				if (result == BulkOnlyResult.RecoveryFailed) {
+					phase = 12
+				}
+
+				if (result == BulkOnlyResult.Disconnected) {
+					phase = 13
+				}
+
+				if (result == BulkOnlyResult.Cancelled) {
+					phase = 14
+				}
+
+				return false
+			}
+
+			if (!ready) {
+				ReadSense()
+
+				for (var cycle: logic[RETRY_BITS] = 0; (cycle as uint) < RETRY_TICKS; cycle++) {
+					state {}
+				}
+
+				if (!controller.IsConnected()) {
+					return false
+				}
+			}
+		}
+
+		if (!ready) {
+			phase = 15
+			return false
+		}
+
+		phase = 10
+
+		if (transport.Execute(ReadOnlyScsiCommand.READ_CAPACITY, 0, 8) != BulkOnlyResult.Passed
+			|| transport.GetLength() != 8) {
+			return false
+		}
+
+		var last = DataWord(0)
+		var size = DataWord(4)
+
+		if (last == (0xFFFFFFFF as uint) || size != 512) {
+			return false
+		}
+
+		blocks = last + 1
+		return true
+	}
+
+	/** Owns enumeration, SCSI command serialization, disconnect and retained reads. */
+	process Run()
+	{
+		state {
+			online = false
+			blocks = 0
+			status = 0
+			phase = 0
+			sense = 0
+		}
+
+		while (!controller.IsConnected()) {
+			if (owned) {
+				seen = request;
+				finished = true;
+				success = false
+			}
+		}
+
+		status = 1
+		var ready = enumerator.Enumerate()
+		phase = enumerator.GetPhase()
+		status = 2
+
+		if (ready) {
+			ready = Bind()
+		}
+
+		if (ready) {
+			status = 3;
+			ready = Initialize()
+		}
+
+		if (ready) {
+			phase = 6
+			status = 4;
+			online = true
+		} else {
+			status = 5
+		}
+
+		while (controller.IsConnected()) {
+			if (online && seen != request) {
+				// Invalidate the preceding completion before acknowledging this generation.
+				state {
+					finished = false
+					success = false
+					seen = request
+				}
+				var result = transport.Execute(ReadOnlyScsiCommand.READ_BLOCK, lba, 512)
+
+				if (result == BulkOnlyResult.Passed && transport.GetLength() == 512 && !cancelRequest) {
+					success = true
+				} elif (result == BulkOnlyResult.CommandFailed) {
+					ReadSense()
+				} elif (result == BulkOnlyResult.RecoveryFailed) {
+					online = false
+					status = 5
+				}
+
+				finished = true
+			}
+		}
+
+		online = false
+		blocks = 0
+
+		if (owned) {
+			seen = request;
+			finished = true;
+			success = false
+		}
+	}
+}

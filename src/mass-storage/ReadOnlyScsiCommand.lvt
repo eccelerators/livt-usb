@@ -1,0 +1,98 @@
+namespace Livt.Usb.MassStorage
+
+/**
+ * USB's transparent SCSI read-only subset. CDB bytes are emitted in wire order;
+ * multibyte SCSI fields are big endian. No arbitrary or write opcode is exposed.
+ */
+component ReadOnlyScsiCommand
+{
+	public const TEST_UNIT_READY: byte = 0x00
+	public const REQUEST_SENSE: byte = 0x03
+	public const INQUIRY: byte = 0x12
+	public const READ_CAPACITY: byte = 0x25
+	public const READ_BLOCK: byte = 0x28
+
+	/** Exact input length for the supported fixed-size, read-only command profile. */
+	public static fn DataLength[](opcode: byte) int
+	{
+		if (opcode == TEST_UNIT_READY) {
+			return 0
+		}
+
+		if (opcode == REQUEST_SENSE) {
+			return 18
+		}
+
+		if (opcode == INQUIRY) {
+			return 36
+		}
+
+		if (opcode == READ_CAPACITY) {
+			return 8
+		}
+
+		if (opcode == READ_BLOCK) {
+			return 512
+		}
+
+		return -1
+	}
+
+	/** Returns six/ten-byte CDB length, or zero for unsupported commands. */
+	public static fn Length[](opcode: byte) byte
+	{
+		if (opcode == TEST_UNIT_READY || opcode == REQUEST_SENSE || opcode == INQUIRY) {
+			return 6
+		}
+
+		if (opcode == READ_CAPACITY || opcode == READ_BLOCK) {
+			return 10
+		}
+
+		return 0
+	}
+
+	/** Returns one CDB byte, including zero padding through byte fifteen. */
+	public static fn GetByte[](opcode: byte, lba: uint, index: byte) byte
+	{
+		if (Length(opcode) == 0 || index >= 16) {
+			return 0
+		}
+
+		if (index == 0) {
+			return opcode
+		}
+
+		if (index == 4 && opcode == INQUIRY) {
+			return 36
+		}
+
+		if (index == 4 && opcode == REQUEST_SENSE) {
+			return 18
+		}
+
+		if (opcode == READ_BLOCK) {
+			if (index == 2) {
+				return (lba >> 24) as byte
+			}
+
+			if (index == 3) {
+				return (lba >> 16) as byte
+			}
+
+			if (index == 4) {
+				return (lba >> 8) as byte
+			}
+
+			if (index == 5) {
+				return lba as byte
+			}
+
+			if (index == 8) {
+				return 1
+			}
+		}
+
+		return 0
+	}
+}

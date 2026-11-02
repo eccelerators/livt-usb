@@ -2,6 +2,37 @@
 
 All notable changes to this package are documented here.
 
+## 0.0.3
+
+### Added
+
+- `MassStorageHost`, `BulkOnlyTransport` and read-only SCSI command encoding for
+  direct full-speed, LUN-zero, 512-byte block devices through
+  `Livt.IO.IReadOnlyBlockDevice`.
+- Validated command status, bounded readiness retries, retained sense information,
+  stall handling and BOT reset recovery.
+- `IHostController.ClearToggle` exposes endpoint toggle reset after successful halt
+  clearing. Custom controller implementations must implement this member.
+
+### Changed
+
+- Exposed endpoint-table providers through `DeviceEnumerator`, `BootKeyboardHost`
+  and `MassStorageHost`, retaining BRAM defaults and scheduled storage contracts.
+- Forwarded `HostController` packet storage and `STYLE` to the transaction engine;
+  custom packet memory retains the synchronous port timing contract.
+- Reduced retained BOT validation temporaries and grouped independent metadata
+  updates into shared states without changing retained-block ownership.
+
+### Compatibility and dependencies
+
+- `IHostController` implementations must provide `ClearToggle` for endpoint-halt
+  recovery. Existing consumers retain default storage configurations.
+- Depend on published `Livt.IO 1.7.0` for memory providers and the
+  `IReadOnlyBlockDevice` contract; replace the development path dependency with
+  this registry version.
+- Continue to use `Livt.Utils 1.1.0`. UART/CLI integration, filesystems and board
+  support remain outside this package.
+
 ## 0.0.2
 
 ### Changed
