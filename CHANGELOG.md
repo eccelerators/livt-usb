@@ -2,6 +2,14 @@
 
 All notable changes to this package are documented here.
 
+## 0.0.5
+
+### Changed
+
+- Prepare package discovery metadata and publish the README, changelog and
+  license alongside the existing USB components.
+- Update dependencies to Livt.IO 1.8.1 and Livt.Utils 1.1.1.
+
 ## 0.0.4
 
 ### Added

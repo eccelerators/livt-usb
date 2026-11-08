@@ -7,7 +7,7 @@ library alongside `Livt.IO`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
-Version 0.0.4 provides:
+Version 0.0.5 provides:
 
 - `Livt.Usb.IO.Usb2Phy`: low-speed and full-speed signaling with context-derived timing.
 - `Livt.Usb.Packets`: token, data and handshake processing with PID and CRC checks.
@@ -25,11 +25,11 @@ Version 0.0.4 provides:
 
 ```toml
 [dependencies]
-"Livt.Usb" = "0.0.4"
+"Livt.Usb" = "0.0.5"
 ```
 
-`Livt.IO 1.7.0` supplies memory interfaces, storage implementations and the
-transport-independent `IReadOnlyBlockDevice` contract. `Livt.Utils 1.1.0` supplies
+`Livt.IO 1.8.1` supplies memory interfaces, storage implementations and the
+transport-independent `IReadOnlyBlockDevice` contract. `Livt.Utils 1.1.1` supplies
 generic CRC helpers. Applications using their types directly should also declare
 those dependencies.
 
@@ -198,7 +198,7 @@ serializer, including packet bytes, CRCs, ACK handoff and cancellation.
 
 ## 🚧 Scope and Outlook
 
-Version 0.0.4 supports one directly attached low/full-speed device, one active or
+Version 0.0.5 supports one directly attached low/full-speed device, one active or
 retained host request, boot-keyboard HID and full-speed read-only mass storage.
 Standard discovery defaults to a 512-byte configuration bound, four interfaces
 and three nonzero endpoints plus EP0.

@@ -1,12 +1,25 @@
 [project]
 name = "Livt.Usb"
-version = "0.0.4"
+version = "0.0.5"
+description = "USB 2.0 low/full-speed PHY, host transfers, device discovery, HID keyboard, and read-only mass storage for Livt."
+authors = ["Denis Vasilík"]
+repository = "https://github.com/eccelerators/livt-usb"
+homepage = "https://github.com/eccelerators/livt-usb"
+keywords = ["fpga", "usb", "host", "hid", "mass-storage"]
+license = "MIT"
 path = "src"
 outdir = "out"
 
+[project.organization]
+name = "Eccelerators GmbH"
+website = "https://eccelerators.com"
+
+[publish]
+files = ["README.md", "CHANGELOG.md", "LICENSE"]
+
 [dependencies]
-"Livt.Utils" = "1.1.0"
-"Livt.IO" = "1.7.0"
+"Livt.Utils" = "1.1.1"
+"Livt.IO" = "1.8.1"
 
 [tests]
 path = "tests"
